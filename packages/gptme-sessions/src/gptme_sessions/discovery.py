@@ -38,6 +38,22 @@ def _get_cc_projects_dir() -> Path:
     return DEFAULT_CC_PROJECTS_DIR
 
 
+def _get_codex_sessions_dir() -> Path:
+    """Get Codex CLI sessions directory from env or default."""
+    env_dir = os.environ.get("CODEX_SESSIONS_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return DEFAULT_CODEX_SESSIONS_DIR
+
+
+def _get_copilot_state_dir() -> Path:
+    """Get Copilot CLI session-state directory from env or default."""
+    env_dir = os.environ.get("COPILOT_STATE_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return DEFAULT_COPILOT_STATE_DIR
+
+
 def _session_in_range(session_name: str, start: date, end: date) -> bool:
     """Check if a gptme session directory name falls within a date range.
 
@@ -205,7 +221,7 @@ def discover_codex_sessions(
     Returns sorted list of session JSONL file paths.
     """
     if codex_dir is None:
-        codex_dir = DEFAULT_CODEX_SESSIONS_DIR
+        codex_dir = _get_codex_sessions_dir()
     if not codex_dir.exists():
         logger.debug("Codex sessions directory does not exist: %s", codex_dir)
         return []
@@ -252,7 +268,7 @@ def discover_copilot_sessions(
     Returns sorted list of session JSONL file paths.
     """
     if copilot_dir is None:
-        copilot_dir = DEFAULT_COPILOT_STATE_DIR
+        copilot_dir = _get_copilot_state_dir()
     if not copilot_dir.exists():
         logger.debug("Copilot session-state directory does not exist: %s", copilot_dir)
         return []
