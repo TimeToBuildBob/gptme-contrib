@@ -2181,6 +2181,7 @@ def test_post_session_cli_json_output(tmp_path: Path, capsys, monkeypatch):
     assert "grade" in out
     assert "token_count" in out
 
+
 # ============================================================
 # Codex CLI format tests
 # ============================================================
