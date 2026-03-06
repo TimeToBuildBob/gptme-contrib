@@ -61,12 +61,12 @@ def _detect_format(msgs: list[dict]) -> str:
         first = msgs[0]
         # Codex: first line is always session_meta
         if first.get("type") == "session_meta":
-            payload = first.get("payload", {})
+            payload = first.get("payload") or {}
             if payload.get("originator") in ("codex_exec", "codex_interactive"):
                 return "codex"
         # Copilot: first line is always session.start
         if first.get("type") == "session.start":
-            data = first.get("data", {})
+            data = first.get("data") or {}
             if data.get("producer") == "copilot-agent":
                 return "copilot"
 
@@ -533,7 +533,7 @@ def extract_signals_codex(msgs: list[dict]) -> dict:
             current_turn_has_tool = False
 
         elif rec_type == "response_item":
-            payload = record.get("payload", {})
+            payload = record.get("payload") or {}
             payload_type = payload.get("type", "")
 
             if payload_type == "function_call":
@@ -645,7 +645,7 @@ def extract_signals_copilot(msgs: list[dict]) -> dict:
             timestamps.append(ts)
 
         if rec_type == "assistant.message":
-            data = record.get("data", {})
+            data = record.get("data") or {}
             tool_requests = data.get("toolRequests", [])
             step_has_tool = False
 
@@ -686,7 +686,7 @@ def extract_signals_copilot(msgs: list[dict]) -> dict:
                 steps += 1
 
         elif rec_type == "tool.execution_complete":
-            data = record.get("data", {})
+            data = record.get("data") or {}
 
             # Error detection from tool failure
             if not data.get("success", True):
@@ -740,12 +740,12 @@ def extract_usage_codex(msgs: list[dict]) -> dict:
         rec_type = record.get("type", "")
 
         if rec_type == "turn_context":
-            m = record.get("payload", {}).get("model")
+            m = (record.get("payload") or {}).get("model")
             if m:
                 model = m
 
         elif rec_type == "event_msg":
-            payload = record.get("payload", {})
+            payload = record.get("payload") or {}
             if payload.get("type") == "token_count":
                 rl = payload.get("rate_limits", {})
                 primary = rl.get("primary", {})

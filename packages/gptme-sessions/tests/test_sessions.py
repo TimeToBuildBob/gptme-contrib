@@ -2713,3 +2713,76 @@ def test_extract_from_path_copilot(tmp_path: Path):
     assert result["tool_calls"]["bash"] == 1
     # Copilot has no token data
     assert "usage" not in result
+
+
+def test_detect_format_codex_null_payload():
+    """_detect_format doesn't crash when session_meta has explicit null payload."""
+    msgs = [{"type": "session_meta", "payload": None}]
+    # Should fall through to default "gptme" without AttributeError
+    assert _detect_format(msgs) == "gptme"
+
+
+def test_detect_format_copilot_null_data():
+    """_detect_format doesn't crash when session.start has explicit null data."""
+    msgs = [{"type": "session.start", "data": None}]
+    # Should fall through to default "gptme" without AttributeError
+    assert _detect_format(msgs) == "gptme"
+
+
+def test_extract_signals_codex_null_payload():
+    """extract_signals_codex doesn't crash with null payload in response_item."""
+    msgs: list[dict] = [
+        {
+            "type": "session_meta",
+            "payload": {"originator": "codex_exec", "session_id": "s1"},
+        },
+        {"type": "turn_context", "payload": {"model": "gpt-4"}},
+        {"type": "response_item", "payload": None},  # explicit null
+    ]
+    result = extract_signals_codex(msgs)
+    assert result["steps"] == 0
+    assert result["error_count"] == 0
+
+
+def test_extract_usage_codex_null_payload():
+    """extract_usage_codex doesn't crash with null payload in event_msg or turn_context."""
+    msgs = [
+        {"type": "turn_context", "payload": None},  # explicit null
+        {"type": "event_msg", "payload": None},  # explicit null
+    ]
+    # No model found → returns {}
+    result = extract_usage_codex(msgs)
+    assert result == {}
+
+
+def test_extract_signals_copilot_null_data_assistant():
+    """extract_signals_copilot doesn't crash with null data in assistant.message."""
+    msgs: list[dict] = [
+        {
+            "type": "session.start",
+            "data": {"producer": "copilot-agent"},
+            "timestamp": "2026-03-03T12:00:00Z",
+        },
+        {"type": "assistant.message", "data": None, "timestamp": "2026-03-03T12:00:05Z"},
+    ]
+    result = extract_signals_copilot(msgs)
+    assert result["steps"] == 0
+    assert result["error_count"] == 0
+
+
+def test_extract_signals_copilot_null_data_tool():
+    """extract_signals_copilot doesn't crash with null data in tool.execution_complete."""
+    msgs: list[dict] = [
+        {
+            "type": "session.start",
+            "data": {"producer": "copilot-agent"},
+            "timestamp": "2026-03-03T12:00:00Z",
+        },
+        {
+            "type": "tool.execution_complete",
+            "data": None,  # explicit null
+            "timestamp": "2026-03-03T12:00:05Z",
+        },
+    ]
+    result = extract_signals_copilot(msgs)
+    assert result["error_count"] == 0
