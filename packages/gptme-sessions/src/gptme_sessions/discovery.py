@@ -273,9 +273,9 @@ def discover_copilot_sessions(
         logger.debug("Copilot session-state directory does not exist: %s", copilot_dir)
         return []
 
-    sessions: list[Path] = []
+    dated_sessions: list[tuple[date, Path]] = []
     try:
-        for session_dir in sorted(copilot_dir.iterdir()):
+        for session_dir in copilot_dir.iterdir():
             if not session_dir.is_dir():
                 continue
             events_file = session_dir / "events.jsonl"
@@ -285,8 +285,7 @@ def discover_copilot_sessions(
             if session_date is None:
                 continue
             if start <= session_date <= end:
-                sessions.append(events_file)
+                dated_sessions.append((session_date, events_file))
     except PermissionError:
         logger.debug("Permission denied reading: %s", copilot_dir)
-    return sessions
-
+    return [p for _, p in sorted(dated_sessions)]
