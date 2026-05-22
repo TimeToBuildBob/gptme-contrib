@@ -295,3 +295,89 @@ def test_empty_repo_skips_live_pr_fetch() -> None:
         assert second.returncode in (0, 1), second.stderr
         assert second_count == 1, "second run should add no PR fetches for empty repo"
         assert "merge_conflict" not in second.stdout, second.stdout
+
+
+# Stale-cache stub: first fetch returns [], subsequent fetches return a
+# conflicting PR. Simulates a PR opened after the empty cache was seeded.
+FAKE_GH_STALE_EMPTY_CACHE = r"""#!/usr/bin/env python3
+from __future__ import annotations
+import json, os, sys
+from pathlib import Path
+
+argv = sys.argv[1:]
+count_file = Path(os.environ["GH_PR_LIST_CALL_COUNT"])
+
+def bump() -> int:
+    n = int(count_file.read_text().strip()) if count_file.exists() else 0
+    n += 1
+    count_file.write_text(str(n))
+    return n
+
+if not argv:
+    sys.exit(2)
+
+if argv[0] == "pr" and len(argv) > 1 and argv[1] == "list":
+    call = bump()
+    if call == 1:
+        # First run: repo has no open PRs yet.
+        print("[]")
+    else:
+        # A PR with a conflict was opened during the cache window. The guard
+        # skips this call because cached data still shows 0 PRs — these
+        # lines are only reached after the cache expires.
+        pr = [{
+            "number": 42,
+            "title": "New PR with conflict",
+            "updatedAt": "2026-05-22T00:00:00Z",
+            "comments": [],
+            "latestReviews": [],
+            "statusCheckRollup": None,
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "headRefOid": "cafebabe",
+            "isDraft": False,
+        }]
+        print(json.dumps(pr))
+    sys.exit(0)
+
+if argv[0] in ("issue", "run") and len(argv) > 1 and argv[1] == "list":
+    print("[]")
+    sys.exit(0)
+
+# repo list / api / anything else: succeed silently.
+sys.exit(0)
+"""
+
+
+def test_stale_empty_cache_defers_conflict_detection() -> None:
+    """Known window: if a PR is opened after an empty cache is seeded, the
+    live merge-status fetch is skipped on the next run because the cached
+    count is still 0. Conflict detection is deferred until the cache TTL
+    (~8 min) expires and the next cached fetch picks up the new PR.
+
+    This is the intentional trade-off from PR #958: up to one cache-TTL
+    detection delay for repos that transition from 0 → 1 open PR, in exchange
+    for eliminating the dominant idle-time GraphQL burner (~87% of rate-limit
+    usage on repos with no active author PRs)."""
+    with tempfile.TemporaryDirectory() as tmp_str:
+        tmp = Path(tmp_str)
+        state_dir = tmp / "state"
+        state_dir.mkdir()
+
+        # Run 1: no open PRs, cache seeded with []. One gh call.
+        first, first_count = _run_gate_jsonl(tmp, state_dir, FAKE_GH_STALE_EMPTY_CACHE)
+        assert first.returncode in (0, 1), first.stderr
+        assert first_count == 1, "first run: one cached PR fetch, live skipped"
+        assert "merge_conflict" not in first.stdout, first.stdout
+
+        # Run 2: a PR with a conflict was opened during the cache window.
+        # The cache still returns [] (TTL not expired) → live fetch skipped.
+        # The conflicting PR is NOT detected this cycle — documented trade-off.
+        second, second_count = _run_gate_jsonl(
+            tmp, state_dir, FAKE_GH_STALE_EMPTY_CACHE
+        )
+        assert second.returncode in (0, 1), second.stderr
+        assert second_count == 1, "second run: cache hit, no new gh calls"
+        assert (
+            "merge_conflict" not in second.stdout
+        ), "conflict not yet detected within stale-cache window — known trade-off"
