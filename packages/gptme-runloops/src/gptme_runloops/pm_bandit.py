@@ -182,10 +182,12 @@ class PmModelBandit:
                 continue
             try:
                 data = json.loads(path.read_text())
+                staged: dict[str, BanditArm] = {}
                 for aid, arm_data in data.get("arms", {}).items():
-                    self.arms[aid] = BanditArm(**arm_data)
+                    staged[aid] = BanditArm(**arm_data)
+                self.arms = staged
                 return
-            except (json.JSONDecodeError, TypeError, KeyError):
+            except (json.JSONDecodeError, TypeError, KeyError, ValueError):
                 continue
 
     def _save(self) -> None:
