@@ -1285,12 +1285,21 @@ class TestClassifyItemWorkType:
 class _StubBandit:
     """Minimal bandit stub for testing dispatch wiring without real PmModelBandit."""
 
-    def __init__(self, counts: dict[str, int], model: str = "haiku"):
+    def __init__(
+        self, counts: dict[str, int], model: str = "haiku", summary_model: str = "m1"
+    ):
         self._counts = counts
         self._model = model
+        # summary_model is the key used in the summary dict — must match the
+        # model names in the available list for _bandit_observation_count to
+        # count them correctly.
+        self._summary_model = summary_model
 
     def summary(self) -> dict:
-        return {wt: {"m1": {"selections": cnt}} for wt, cnt in self._counts.items()}
+        return {
+            wt: {self._summary_model: {"selections": cnt}}
+            for wt, cnt in self._counts.items()
+        }
 
     def resolve_model(self, work_type: str, available: list[str]) -> str:
         return self._model
@@ -1299,18 +1308,23 @@ class _StubBandit:
 class TestBanditObservationCount:
     def test_empty(self):
         bandit = _StubBandit({})
-        assert _bandit_observation_count(bandit, "ci-fix") == 0
+        assert _bandit_observation_count(bandit, "ci-fix", ["m1"]) == 0
 
     def test_with_observations(self):
         bandit = _StubBandit({"ci-fix": 7})
-        assert _bandit_observation_count(bandit, "ci-fix") == 7
+        assert _bandit_observation_count(bandit, "ci-fix", ["m1"]) == 7
 
     def test_different_work_type(self):
         bandit = _StubBandit({"ci-fix": 7})
-        assert _bandit_observation_count(bandit, "pr-review") == 0
+        assert _bandit_observation_count(bandit, "pr-review", ["m1"]) == 0
 
     def test_malformed_bandit_returns_zero(self):
-        assert _bandit_observation_count(None, "ci-fix") == 0
+        assert _bandit_observation_count(None, "ci-fix", ["m1"]) == 0
+
+    def test_retired_model_not_counted(self):
+        # Observations for "old-model" must not cross the threshold for "new-model".
+        bandit = _StubBandit({"ci-fix": 10}, summary_model="old-model")
+        assert _bandit_observation_count(bandit, "ci-fix", ["new-model"]) == 0
 
 
 class TestResolveModelWithBandit:
@@ -1322,7 +1336,11 @@ class TestResolveModelWithBandit:
         assert result == "sonnet"
 
     def test_bandit_below_threshold_falls_back(self):
-        bandit = _StubBandit({"ci-fix": MIN_BANDIT_OBSERVATIONS - 1}, model="haiku")
+        bandit = _StubBandit(
+            {"ci-fix": MIN_BANDIT_OBSERVATIONS - 1},
+            model="haiku",
+            summary_model="sonnet",
+        )
         result = _resolve_model_with_bandit(
             ["ci_failure"], "slow", "sonnet", "haiku-fast", bandit
         )
@@ -1330,21 +1348,29 @@ class TestResolveModelWithBandit:
         assert result == "sonnet"
 
     def test_bandit_at_threshold_uses_bandit(self):
-        bandit = _StubBandit({"ci-fix": MIN_BANDIT_OBSERVATIONS}, model="haiku")
+        bandit = _StubBandit(
+            {"ci-fix": MIN_BANDIT_OBSERVATIONS},
+            model="haiku",
+            summary_model="sonnet",
+        )
         result = _resolve_model_with_bandit(
             ["ci_failure"], "slow", "sonnet", "haiku-fast", bandit
         )
         assert result == "haiku"
 
     def test_bandit_above_threshold_uses_bandit(self):
-        bandit = _StubBandit({"ci-fix": MIN_BANDIT_OBSERVATIONS + 10}, model="sonnet")
+        bandit = _StubBandit(
+            {"ci-fix": MIN_BANDIT_OBSERVATIONS + 10},
+            model="sonnet",
+            summary_model="sonnet",
+        )
         result = _resolve_model_with_bandit(
             ["ci_failure"], "fast", "sonnet", "haiku", bandit
         )
         assert result == "sonnet"
 
     def test_bandit_no_available_models_defaults_sonnet(self):
-        bandit = _StubBandit({"ci-fix": 10}, model="sonnet")
+        bandit = _StubBandit({"ci-fix": 10}, model="sonnet", summary_model="sonnet")
         result = _resolve_model_with_bandit(["ci_failure"], "slow", None, None, bandit)
         assert result == "sonnet"
 
@@ -1380,7 +1406,11 @@ class TestLaneDispatcherWithBandit:
     def test_dispatch_with_bandit_below_threshold_uses_static(self):
         launched = []
         dispatcher = self._make_dispatcher(launched, [])
-        bandit = _StubBandit({"ci-fix": MIN_BANDIT_OBSERVATIONS - 1}, model="haiku")
+        bandit = _StubBandit(
+            {"ci-fix": MIN_BANDIT_OBSERVATIONS - 1},
+            model="haiku",
+            summary_model="sonnet",
+        )
         items = [SlotItem("r/r", 1, ["ci_failure"], "CI fix")]
         dispatcher.dispatch(items, model="sonnet", fast_model="haiku-f", bandit=bandit)
         assert launched[0]["model"] == "sonnet"  # static fallback
@@ -1388,7 +1418,11 @@ class TestLaneDispatcherWithBandit:
     def test_dispatch_with_bandit_above_threshold_uses_bandit(self):
         launched = []
         dispatcher = self._make_dispatcher(launched, [])
-        bandit = _StubBandit({"ci-fix": MIN_BANDIT_OBSERVATIONS + 5}, model="haiku")
+        bandit = _StubBandit(
+            {"ci-fix": MIN_BANDIT_OBSERVATIONS + 5},
+            model="haiku",
+            summary_model="sonnet",
+        )
         items = [SlotItem("r/r", 1, ["ci_failure"], "CI fix")]
         dispatcher.dispatch(items, model="sonnet", fast_model="haiku-f", bandit=bandit)
         assert launched[0]["model"] == "haiku"  # bandit choice
@@ -1438,3 +1472,21 @@ class TestRecordBanditOutcomeCLI:
         data = json.loads((tmp_path / "bandit-state.json").read_text())
         arm = data["arms"]["pm-model:pr-review:sonnet"]
         assert arm["alpha"] == pytest.approx(1.75)
+
+    def test_record_outcome_invalid_string_exits(self, tmp_path):
+        from gptme_runloops.pm_dispatch import _record_bandit_outcome_main
+
+        with pytest.raises(SystemExit) as exc_info:
+            _record_bandit_outcome_main(
+                [
+                    "--work-type",
+                    "ci-fix",
+                    "--model",
+                    "haiku",
+                    "--outcome",
+                    "Productive",  # wrong capitalisation — must be rejected
+                    "--state-dir",
+                    str(tmp_path),
+                ]
+            )
+        assert exc_info.value.code != 0
