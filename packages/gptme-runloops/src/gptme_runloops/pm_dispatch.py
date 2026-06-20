@@ -12,8 +12,11 @@ remain the primary dispatch path (see project-monitoring-upstream-overhaul).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import re
 import sys
 from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
@@ -37,6 +40,9 @@ DEFAULT_SLOT_CAP = 3
 
 # Default number of fast-lane burst slots above cap
 DEFAULT_FAST_BURST_ALLOWANCE = 1
+
+# Minimum bandit observations before preferring bandit routing over static fallback
+MIN_BANDIT_OBSERVATIONS = 5
 
 logger = logging.getLogger(__name__)
 
@@ -246,14 +252,42 @@ def append_full_ledger_entry(
 # --- Slot key derivation ---
 
 
-def derive_slot_key(repo: str, number: int | None, types: list[str]) -> str:
+def _slugify_check(name: str) -> str:
+    """Slugify a CI check/workflow name for use in a slot key.
+
+    Lowercases, collapses non-alphanumerics to single dashes, trims dashes.
+    Empty/whitespace-only names fall back to ``"unknown"``.
+    All-punctuation inputs (non-blank but produce an empty slug) use a short
+    hash so they never collide with a check literally named ``"unknown"``.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if slug:
+        return slug
+    if not name.strip():
+        return "unknown"
+    # Non-blank name but all-punctuation: use a hash to avoid collision with
+    # a check literally named "unknown".
+    return "x" + hashlib.sha1(name.encode()).hexdigest()[:6]
+
+
+def derive_slot_key(
+    repo: str, number: int | None, types: list[str], check: str | None = None
+) -> str:
     """Derive a slot key from a work item.
 
     Matches the bash ``derive_slot_key()`` logic:
-      - master_ci_failure types → ``{repo}#master-ci``
+      - master_ci_failure types → ``{repo}#master-ci:{check-slug}`` when a
+        check/workflow name is known, else ``{repo}#master-ci``
       - others → ``{repo}#{number}``
+
+    The per-check slug is what keeps two *concurrent* master-CI failures on the
+    same repo (e.g. ``test-e2e`` and ``Conformance Check``) from collapsing into
+    one slot — a long-running failure on check A must never mask detection or
+    dispatch of a new failure on check B.
     """
     if "master_ci_failure" in types:
+        if check and check.strip():
+            return f"{repo}#master-ci:{_slugify_check(check)}"
         return f"{repo}#master-ci"
     if number is not None:
         return f"{repo}#{number}"
@@ -273,6 +307,77 @@ def classify_lane(types: list[str]) -> str:
     return "fast"
 
 
+def classify_item_work_type(types: list[str]) -> str:
+    """Map SlotItem.types to a PM bandit work type string.
+
+    Priority order is significant: ci-fix and greptile-fix take precedence over
+    pr-review since a PR with a CI failure should route to the CI-fix arm, not
+    the generic PR-review arm.
+
+    Returns one of the PM_WORK_TYPES strings defined in pm_bandit.
+    """
+    types_set = set(types)
+    if "strategy" in types_set:
+        return "strategy-reply"
+    if types_set & {"ci_failure", "master_ci_failure"}:
+        return "ci-fix"
+    if types_set & {"greptile_needs_fix", "greptile_needs_improvement"}:
+        return "greptile-fix"
+    if "merge_conflict" in types_set:
+        return "merge-conflict"
+    if "pr_update" in types_set:
+        return "pr-review"
+    if "assigned" in types_set:
+        return "assigned-issue"
+    return "notification-triage"
+
+
+def _bandit_observation_count(
+    bandit: Any, work_type: str, models: list[str] | None = None
+) -> int:
+    """Count recorded outcomes for work_type, optionally filtered to specific models.
+
+    When *models* is provided, only counts observations for those model names.
+    When None, counts across all models (legacy — prefer passing available models
+    to avoid threshold crossings driven by retired model arms).
+    """
+    total = 0
+    try:
+        summary = bandit.summary().get(work_type, {})
+        for model_name, model_data in summary.items():
+            if models is not None and model_name not in models:
+                continue
+            total += int(model_data.get("selections", 0))
+    except (AttributeError, TypeError):
+        pass
+    return total
+
+
+def _resolve_model_with_bandit(
+    item_types: list[str],
+    lane: str,
+    model: str | None,
+    fast_model: str | None,
+    bandit: Any | None,
+) -> str | None:
+    """Resolve the dispatch model for an item.
+
+    When a bandit is provided and has ≥ MIN_BANDIT_OBSERVATIONS for the
+    inferred work type, use Thompson sampling to select the model.
+    Otherwise fall back to the static resolve_lane_model() split.
+    """
+    if bandit is None:
+        return resolve_lane_model(lane, model, fast_model)
+    work_type = classify_item_work_type(item_types)
+    available = [m for m in [model, fast_model] if m]
+    if not available:
+        available = ["sonnet"]
+    obs = _bandit_observation_count(bandit, work_type, models=available)
+    if obs < MIN_BANDIT_OBSERVATIONS:
+        return resolve_lane_model(lane, model, fast_model)
+    return bandit.resolve_model(work_type, available)
+
+
 def partition_items(items: list[SlotItem]) -> tuple[list[SlotItem], list[SlotItem]]:
     """Partition items into (fast_items, slow_items)."""
     fast: list[SlotItem] = []
@@ -283,6 +388,28 @@ def partition_items(items: list[SlotItem]) -> tuple[list[SlotItem], list[SlotIte
         else:
             slow.append(item)
     return fast, slow
+
+
+def resolve_lane_model(
+    lane: str,
+    base_model: str | None,
+    fast_model: str | None = None,
+) -> str | None:
+    """Resolve the model to use for a dispatch *lane*.
+
+    Per-lane model routing (ErikBjare/bob#860): the fast lane (notifications,
+    assigned-issue triage — everything not in ``SLOW_LANE_TYPES``) is the
+    low-intelligence-needed partition, so it can run on a cheaper model while
+    the slow lane (PR reviews, CI diagnostics, Greptile, merge conflicts) keeps
+    the capable model.
+
+    Opt-in and default-off: with ``fast_model`` unset (``None``), every lane
+    gets ``base_model`` — identical to the prior single-model behavior. The
+    bash runtime mirrors this via the ``BOB_PM_FAST_LANE_MODEL`` env var.
+    """
+    if lane == "fast" and fast_model:
+        return fast_model
+    return base_model
 
 
 # --- DispatchLedger ---
@@ -360,6 +487,8 @@ class LaneDispatcher:
         backend: str = "claude-code",
         model: str | None = None,
         script_path: str | None = None,
+        fast_model: str | None = None,
+        bandit: Any = None,
     ) -> tuple[int, int]:
         """Dispatch items via transient systemd units.
 
@@ -367,11 +496,24 @@ class LaneDispatcher:
         - derives a slot key and unit name
         - skips if the slot is already busy
         - checks slot availability (cap + burst)
+        - resolves the per-lane model (see ``resolve_lane_model``)
         - launches via ``dispatch_callback`` or default systemd-run
+
+        ``fast_model`` (falling back to the ``BOB_PM_FAST_LANE_MODEL`` env var)
+        opts the fast lane onto a cheaper model; unset preserves the single
+        ``model`` for every lane (ErikBjare/bob#860).
+
+        ``bandit``, when provided, overrides the static lane-based split with
+        Thompson-sampling routing per work type once ≥ MIN_BANDIT_OBSERVATIONS
+        outcomes have been recorded. Falls back to ``resolve_lane_model()``
+        below the threshold. Pass a :class:`~gptme_runloops.pm_bandit.PmModelBandit`
+        instance.
 
         Returns:
             (launched_count, deferred_count)
         """
+        if fast_model is None:
+            fast_model = os.environ.get("BOB_PM_FAST_LANE_MODEL") or None
         fast_items, slow_items = partition_items(items)
 
         launched = 0
@@ -391,7 +533,9 @@ class LaneDispatcher:
 
         for lane, lane_items in [("fast", fast_items), ("slow", slow_items)]:
             for item in lane_items:
-                slot_key = derive_slot_key(item.repo, item.number, item.types)
+                slot_key = derive_slot_key(
+                    item.repo, item.number, item.types, item.title
+                )
                 unit_name = _derive_unit_name(slot_key, lane)
                 legacy_name = _derive_legacy_unit_name(slot_key)
 
@@ -407,7 +551,7 @@ class LaneDispatcher:
                     deferred += 1
                     continue
 
-                # Launch
+                # Launch — bandit-driven model selection when observations ≥ threshold
                 success = self._launch_unit(
                     unit_name=unit_name,
                     legacy_name=legacy_name,
@@ -415,7 +559,9 @@ class LaneDispatcher:
                     lane=lane,
                     item=item,
                     backend=backend,
-                    model=model,
+                    model=_resolve_model_with_bandit(
+                        item.types, lane, model, fast_model, bandit
+                    ),
                     script_path=script_path,
                 )
 
@@ -815,7 +961,7 @@ def dispatch_grouped_items(
 
     for lane, lane_items in [("fast", fast), ("slow", slow)]:
         for item in lane_items:
-            key = derive_slot_key(item.repo, item.number, item.types)
+            key = derive_slot_key(item.repo, item.number, item.types, item.title)
 
             if _is_busy(key):
                 result.skipped_active += 1
@@ -910,6 +1056,76 @@ def _append_ledger_main(argv: list[str]) -> int:
     return 0
 
 
+def _record_bandit_outcome_main(argv: list[str]) -> int:
+    """CLI handler for the ``record-bandit-outcome`` subcommand.
+
+    Loads the PmModelBandit and records one dispatch outcome. Designed for
+    bash post-session hooks to call after a slot session completes.
+
+    Example::
+
+        python3 -m gptme_runloops.pm_dispatch record-bandit-outcome \\
+            --work-type ci-fix --model haiku --outcome productive
+    """
+    import argparse
+
+    from gptme_runloops.pm_bandit import PmModelBandit
+
+    parser = argparse.ArgumentParser(
+        prog="pm_dispatch record-bandit-outcome",
+        description="Record a PM dispatch outcome into the bandit state.",
+    )
+    parser.add_argument(
+        "--work-type",
+        required=True,
+        help="PM work type (e.g. ci-fix, greptile-fix, pr-review)",
+    )
+    parser.add_argument(
+        "--model", required=True, help="Model that handled the dispatch (e.g. haiku)"
+    )
+    parser.add_argument(
+        "--outcome",
+        required=True,
+        help="Session outcome: 'productive', 'failed', or a float 0-1",
+    )
+    parser.add_argument(
+        "--state-dir",
+        default=None,
+        help="Override bandit state directory (default: state/pm-dispatch)",
+    )
+    args = parser.parse_args(argv)
+
+    from gptme_runloops.pm_bandit import PM_WORK_TYPES
+
+    if args.work_type not in PM_WORK_TYPES:
+        parser.error(
+            f"--work-type {args.work_type!r} is not a known PM work type; "
+            f"valid values: {sorted(PM_WORK_TYPES)}"
+        )
+
+    _VALID_OUTCOMES = {"productive", "failed"}
+    outcome_val: str | float
+    try:
+        outcome_val = float(args.outcome)
+    except ValueError:
+        if args.outcome not in _VALID_OUTCOMES:
+            parser.error(
+                f"--outcome must be 'productive', 'failed', or a float 0-1; "
+                f"got {args.outcome!r}"
+            )
+        outcome_val = args.outcome
+
+    bandit = PmModelBandit(state_dir=args.state_dir)
+    bandit.record_outcome(args.work_type, args.model, outcome_val)
+    logger.info(
+        "Recorded outcome: work_type=%s model=%s outcome=%s",
+        args.work_type,
+        args.model,
+        args.outcome,
+    )
+    return 0
+
+
 def _records_aggregate_main(argv: list[str]) -> int:
     """CLI handler for the ``records-aggregate`` subcommand.
 
@@ -955,6 +1171,9 @@ def main() -> None:
 
       records-aggregate --records-dir DIR
         Aggregate per-item JSON records into a single JSON array on stdout.
+
+      record-bandit-outcome --work-type W --model M --outcome O
+        Record a dispatch outcome into the PmModelBandit state.
     """
     import sys as _sys
 
@@ -965,6 +1184,8 @@ def main() -> None:
         _sys.exit(_append_ledger_main(argv[1:]))
     if argv and argv[0] == "records-aggregate":
         _sys.exit(_records_aggregate_main(argv[1:]))
+    if argv and argv[0] == "record-bandit-outcome":
+        _sys.exit(_record_bandit_outcome_main(argv[1:]))
     if argv and argv[0] == "partition":
         argv = argv[1:]
 

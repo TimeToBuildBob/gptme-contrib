@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import subprocess
@@ -22,6 +23,24 @@ self_merge_check = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = self_merge_check
 spec.loader.exec_module(self_merge_check)
 
+# Real (unpatched) helper, captured before the autouse fixture swaps it for a Mock.
+_REAL_MERGE_PERMISSION = self_merge_check.merge_permission.__wrapped__
+
+
+@pytest.fixture(autouse=True)
+def _stub_merge_permission():
+    """Default merge_permission to True so evaluate_pr tests don't make a live
+    gh call (and aren't sensitive to the test runner's actual repo access).
+
+    merge_permission is @cache'd, so clear the cache around each test to keep
+    per-test patches (True/False/None) isolated. Tests exercising the
+    permission gate itself patch merge_permission explicitly.
+    """
+    self_merge_check.merge_permission.cache_clear()
+    with patch.object(self_merge_check, "merge_permission", return_value=True):
+        yield
+    self_merge_check.merge_permission.cache_clear()
+
 
 def test_checks_green_rejects_indeterminate_check() -> None:
     assert not self_merge_check.checks_green([{"status": None, "conclusion": None}])
@@ -39,6 +58,37 @@ def test_checks_green_rejects_completed_without_conclusion() -> None:
 
 def test_checks_green_allows_empty_list() -> None:
     assert self_merge_check.checks_green([])
+
+
+def test_checks_green_allows_success_statuscontext() -> None:
+    # StatusContext (legacy commit status, e.g. codecov/patch) carries its
+    # result in `state` with no status/conclusion. A green one must pass.
+    assert self_merge_check.checks_green(
+        [
+            {
+                "__typename": "StatusContext",
+                "context": "codecov/patch",
+                "state": "SUCCESS",
+            }
+        ]
+    )
+
+
+def test_checks_green_rejects_non_success_statuscontext() -> None:
+    for bad in ("PENDING", "FAILURE", "ERROR", "EXPECTED"):
+        assert not self_merge_check.checks_green(
+            [{"__typename": "StatusContext", "context": "ci", "state": bad}]
+        )
+
+
+def test_checks_green_mixed_checkrun_and_statuscontext() -> None:
+    # A green CheckRun alongside a green StatusContext should pass.
+    assert self_merge_check.checks_green(
+        [
+            {"status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"state": "SUCCESS"},
+        ]
+    )
 
 
 def test_parse_pr_target_rejects_malformed_url() -> None:
@@ -75,6 +125,32 @@ def test_parse_pr_target_strips_fragment() -> None:
     assert number == 504
 
 
+def test_parse_pr_target_accepts_repo_hash_number() -> None:
+    """The documented 'owner/repo#number' specifier must parse."""
+    repo, number = self_merge_check.parse_pr_target(
+        "ActivityWatch/activitywatch.github.io#54", None, None
+    )
+    assert repo == "ActivityWatch/activitywatch.github.io"
+    assert number == 54
+
+
+def test_parse_pr_target_accepts_repo_and_positional_number() -> None:
+    """Two-positional 'owner/repo <number>' form must parse, not raise."""
+    repo, number = self_merge_check.parse_pr_target(
+        "ActivityWatch/activitywatch.github.io", None, 54
+    )
+    assert repo == "ActivityWatch/activitywatch.github.io"
+    assert number == 54
+
+
+def test_parse_pr_target_repo_without_number_raises_with_hint() -> None:
+    """A bare 'owner/repo' (no number anywhere) must raise a guiding error."""
+    import pytest
+
+    with pytest.raises(ValueError, match="owner/repo#number"):
+        self_merge_check.parse_pr_target("gptme/gptme", None, None)
+
+
 def test_evaluate_pr_blocks_changes_requested() -> None:
     pr_data = {
         "author": {"login": "TimeToBuildBob"},
@@ -91,9 +167,18 @@ def test_evaluate_pr_blocks_changes_requested() -> None:
         patch.object(self_merge_check, "fetch_pr", return_value=pr_data),
         patch.object(self_merge_check, "get_gh_user", return_value="TimeToBuildBob"),
         patch.object(
+            self_merge_check, "_fetch_greptile_review_data", return_value=None
+        ),
+        patch.object(
             self_merge_check,
             "fetch_greptile_status",
             return_value={"has_review": True, "unresolved": 0, "total": 1},
+        ),
+        patch.object(self_merge_check, "greptile_summary_score", return_value=None),
+        patch.object(
+            self_merge_check,
+            "fetch_unresolved_human_threads",
+            return_value={"unresolved": 0, "total": 0, "authors": []},
         ),
     ):
         result = self_merge_check.evaluate_pr(
@@ -564,6 +649,14 @@ def test_is_sensitive_path_handles_deploy_word_forms(path: str, expected: bool) 
         "scripts/session_bandit.py",
         "scripts/state-delta.py",
         "scripts/state_delta.py",
+        # autonomous/monitoring orchestration entrypoints (the self-merge control path)
+        "scripts/autonomous-run.sh",
+        "scripts/autonomous-run-cc.sh",
+        "scripts/autonomous_run.py",
+        "scripts/autonomous-loop.sh",
+        "scripts/runs/autonomous/autonomous-loop.sh",
+        "scripts/runs/github/project-monitoring.sh",
+        "scripts/runs/github/project_monitoring.py",
     ],
 )
 def test_classify_loop_control_paths_blocked(path: str) -> None:
@@ -589,9 +682,18 @@ def test_evaluate_pr_warns_when_workspace_repos_empty() -> None:
         patch.object(self_merge_check, "fetch_pr", return_value=pr_data),
         patch.object(self_merge_check, "get_gh_user", return_value="TimeToBuildBob"),
         patch.object(
+            self_merge_check, "_fetch_greptile_review_data", return_value=None
+        ),
+        patch.object(
             self_merge_check,
             "fetch_greptile_status",
             return_value={"has_review": True, "unresolved": 0, "total": 1},
+        ),
+        patch.object(self_merge_check, "greptile_summary_score", return_value=5),
+        patch.object(
+            self_merge_check,
+            "fetch_unresolved_human_threads",
+            return_value={"unresolved": 0, "total": 0, "authors": []},
         ),
     ):
         result = self_merge_check.evaluate_pr(
@@ -605,6 +707,160 @@ def test_evaluate_pr_warns_when_workspace_repos_empty() -> None:
     assert (
         result.eligible
     ), f"Explicit opt-out should not disqualify; reasons: {result.reasons}"
+
+
+def _eligible_pr_data() -> dict:
+    return {
+        "author": {"login": "TimeToBuildBob"},
+        "title": "Test PR",
+        "url": "https://github.com/gptme/gptme-contrib/pull/999",
+        "files": [{"path": "tests/test_example.py"}],
+        "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "isDraft": False,
+        "state": "OPEN",
+        "reviewDecision": None,
+    }
+
+
+def _evaluate_otherwise_eligible(merge_perm):
+    """Evaluate an otherwise-eligible PR with a given merge_permission result."""
+    with (
+        patch.object(self_merge_check, "fetch_pr", return_value=_eligible_pr_data()),
+        patch.object(self_merge_check, "get_gh_user", return_value="TimeToBuildBob"),
+        patch.object(
+            self_merge_check, "_fetch_greptile_review_data", return_value=None
+        ),
+        patch.object(
+            self_merge_check,
+            "fetch_greptile_status",
+            return_value={"has_review": True, "unresolved": 0, "total": 1},
+        ),
+        patch.object(self_merge_check, "greptile_summary_score", return_value=5),
+        patch.object(
+            self_merge_check,
+            "fetch_unresolved_human_threads",
+            return_value={"unresolved": 0, "total": 0, "authors": []},
+        ),
+        patch.object(self_merge_check, "merge_permission", return_value=merge_perm),
+    ):
+        return self_merge_check.evaluate_pr(
+            "gptme/gptme-contrib",
+            999,
+            workspace_repos=["gptme/gptme-contrib"],
+        )
+
+
+def test_evaluate_pr_blocks_when_no_merge_permission() -> None:
+    """A definitive lack of merge permission disqualifies (would fail the merge)."""
+    result = _evaluate_otherwise_eligible(False)
+    assert not result.eligible
+    assert any("lacks merge permission" in r for r in result.reasons)
+
+
+def test_evaluate_pr_warns_when_merge_permission_unknown() -> None:
+    """An indeterminate merge permission is a warning, not a disqualifier."""
+    result = _evaluate_otherwise_eligible(None)
+    assert result.eligible, f"reasons: {result.reasons}"
+    assert any("determine merge permission" in w for w in result.warnings)
+
+
+def test_evaluate_pr_eligible_with_merge_permission() -> None:
+    """Explicit merge permission keeps an otherwise-eligible PR eligible."""
+    result = _evaluate_otherwise_eligible(True)
+    assert result.eligible, f"reasons: {result.reasons}"
+
+
+def test_merge_permission_raw_helper() -> None:
+    """The underlying helper maps gh permission payloads to a bool/None."""
+    raw = _REAL_MERGE_PERMISSION
+    with patch.object(
+        self_merge_check, "run_gh", return_value='{"push": true, "admin": false}'
+    ):
+        assert raw("gptme/gptme-contrib") is True
+    with patch.object(
+        self_merge_check,
+        "run_gh",
+        return_value='{"push": false, "maintain": false, "admin": false}',
+    ):
+        assert raw("gptme/gptme-contrib") is False
+    with patch.object(self_merge_check, "run_gh", return_value=""):
+        assert raw("gptme/gptme-contrib") is None
+    with patch.object(self_merge_check, "run_gh", return_value="not json"):
+        assert raw("gptme/gptme-contrib") is None
+    # Dict present but all three expected keys absent — unknown, not disqualified
+    with patch.object(
+        self_merge_check,
+        "run_gh",
+        return_value='{"pull": true, "triage": true}',
+    ):
+        assert raw("gptme/gptme-contrib") is None
+
+
+def test_greptile_summary_score_ignores_signal_disable_env() -> None:
+    completed = subprocess.CompletedProcess(
+        args=["python3"],
+        returncode=1,
+        stdout='{"score": 4}',
+        stderr="",
+    )
+
+    with (
+        patch.dict(
+            self_merge_check.os.environ,
+            {"GREPTILE_MERGE_SIGNAL_DISABLED": "1"},
+            clear=False,
+        ),
+        patch.object(
+            self_merge_check.subprocess, "run", return_value=completed
+        ) as mock_run,
+    ):
+        score = self_merge_check.greptile_summary_score("gptme/gptme-contrib", 1080)
+
+    assert score == 4
+    assert "GREPTILE_MERGE_SIGNAL_DISABLED" not in mock_run.call_args.kwargs["env"]
+
+
+def test_evaluate_pr_invalid_min_score_falls_back_to_default() -> None:
+    pr_data = {
+        "author": {"login": "TimeToBuildBob"},
+        "title": "Test PR",
+        "url": "https://github.com/gptme/gptme-contrib/pull/999",
+        "files": [{"path": "tests/test_example.py"}],
+        "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "isDraft": False,
+        "state": "OPEN",
+        "reviewDecision": None,
+    }
+
+    with (
+        patch.dict(
+            self_merge_check.os.environ,
+            {"SELF_MERGE_MIN_GREPTILE_SCORE": "five"},
+            clear=False,
+        ),
+        patch.object(self_merge_check, "_fetch_greptile_review_data", return_value={}),
+        patch.object(self_merge_check, "fetch_pr", return_value=pr_data),
+        patch.object(self_merge_check, "get_gh_user", return_value="TimeToBuildBob"),
+        patch.object(
+            self_merge_check,
+            "fetch_greptile_status",
+            return_value={"has_review": True, "unresolved": 0, "total": 1},
+        ),
+        patch.object(self_merge_check, "greptile_summary_score", return_value=4),
+        patch.object(
+            self_merge_check,
+            "fetch_unresolved_human_threads",
+            return_value={"unresolved": 0, "authors": []},
+        ),
+    ):
+        result = self_merge_check.evaluate_pr(
+            "gptme/gptme-contrib",
+            999,
+            workspace_repos=["gptme/gptme-contrib"],
+        )
+
+    assert not result.eligible
+    assert "Greptile score 4/5 below floor 5/5" in result.reasons
 
 
 def test_evaluate_pr_disqualified_when_workspace_repos_unknown() -> None:
@@ -898,3 +1154,141 @@ def test_classify_repo_allowlisted_path_is_repo_scoped() -> None:
         )
         assert category is None
         assert any("allowed self-merge category" in reason for reason in reasons)
+
+
+def test_evaluate_pr_captures_head_sha() -> None:
+    """CheckResult.head_sha reflects the headRefOid from fetch_pr."""
+    pr_data = {
+        "author": {"login": "TimeToBuildBob"},
+        "title": "Test PR",
+        "url": "https://github.com/gptme/gptme-contrib/pull/999",
+        "files": [{"path": "tests/test_example.py"}],
+        "statusCheckRollup": [{"status": "COMPLETED", "conclusion": "SUCCESS"}],
+        "isDraft": False,
+        "state": "OPEN",
+        "reviewDecision": None,
+        "headRefOid": "abc123def456",
+    }
+
+    with (
+        patch.object(self_merge_check, "fetch_pr", return_value=pr_data),
+        patch.object(self_merge_check, "get_gh_user", return_value="TimeToBuildBob"),
+        patch.object(
+            self_merge_check, "_fetch_greptile_review_data", return_value=None
+        ),
+        patch.object(
+            self_merge_check,
+            "fetch_greptile_status",
+            return_value={"has_review": True, "unresolved": 0, "total": 1},
+        ),
+        patch.object(self_merge_check, "greptile_summary_score", return_value=5),
+        patch.object(
+            self_merge_check,
+            "fetch_unresolved_human_threads",
+            return_value={"unresolved": 0, "total": 0, "authors": []},
+        ),
+    ):
+        result = self_merge_check.evaluate_pr(
+            "gptme/gptme-contrib",
+            999,
+            workspace_repos=["gptme/gptme-contrib"],
+        )
+
+    assert result.head_sha == "abc123def456"
+
+
+def test_evaluate_pr_head_sha_empty_when_missing() -> None:
+    """head_sha is empty string when fetch_pr returns no headRefOid."""
+    pr_data = {
+        "author": {"login": "TimeToBuildBob"},
+        "title": "Test PR",
+        "url": "https://github.com/gptme/gptme-contrib/pull/999",
+        "files": [{"path": "tests/test_example.py"}],
+        "statusCheckRollup": [],
+        "isDraft": False,
+        "state": "OPEN",
+        "reviewDecision": None,
+        # no headRefOid key
+    }
+
+    with (
+        patch.object(self_merge_check, "fetch_pr", return_value=pr_data),
+        patch.object(self_merge_check, "get_gh_user", return_value="TimeToBuildBob"),
+        patch.object(
+            self_merge_check, "_fetch_greptile_review_data", return_value=None
+        ),
+        patch.object(
+            self_merge_check,
+            "fetch_greptile_status",
+            return_value={"has_review": True, "unresolved": 0, "total": 0},
+        ),
+        patch.object(self_merge_check, "greptile_summary_score", return_value=5),
+        patch.object(
+            self_merge_check,
+            "fetch_unresolved_human_threads",
+            return_value={"unresolved": 0, "total": 0, "authors": []},
+        ),
+    ):
+        result = self_merge_check.evaluate_pr(
+            "gptme/gptme-contrib",
+            999,
+            workspace_repos=["gptme/gptme-contrib"],
+        )
+
+    assert result.head_sha == ""
+
+
+def test_check_result_head_sha_in_json_output() -> None:
+    """head_sha is included in the asdict/JSON serialization."""
+    result = self_merge_check.CheckResult(
+        eligible=True,
+        repo="gptme/gptme-contrib",
+        number=999,
+        url="https://github.com/gptme/gptme-contrib/pull/999",
+        title="Test",
+        author="TimeToBuildBob",
+        head_sha="deadbeef1234",
+    )
+    d = dataclasses.asdict(result)
+    assert d["head_sha"] == "deadbeef1234"
+    assert "head_sha" in json.dumps(d)
+
+
+# --- spec-like docs are root-only (nested package READMEs are ordinary docs) ---
+def test_root_identity_docs_are_spec_like() -> None:
+    for name in ("README.md", "ARCHITECTURE.md", "CLAUDE.md", "AGENTS.md", "GOALS.md"):
+        assert self_merge_check.is_spec_like_doc(name) is True
+
+
+def test_nested_package_readme_is_not_spec_like() -> None:
+    # A nested package README is package docs, not a top-level spec.
+    assert self_merge_check.is_spec_like_doc("packages/gptme-usage/README.md") is False
+    assert self_merge_check.is_spec_like_doc("gptme/server/README.md") is False
+    assert self_merge_check.is_spec_like_doc("docs/ARCHITECTURE.md") is False
+
+
+def test_nested_readme_does_not_disqualify_low_risk_pr() -> None:
+    # Regression: a clean tooling PR touching a nested package README + code +
+    # tests must classify into an allowed category, not be blocked as spec-like.
+    paths = [
+        "packages/gptme-usage/README.md",
+        "packages/gptme-usage/harness-quota.example.toml",
+        "packages/gptme-usage/src/gptme_usage/harness_models.py",
+        "packages/gptme-usage/tests/test_harness_quota_config.py",
+        "scripts/check-quota.py",
+    ]
+    category, reasons = self_merge_check.classify_category(paths, "gptme/gptme-contrib")
+    assert category is not None, reasons
+    assert reasons == []
+
+
+def test_root_readme_still_blocks_self_merge() -> None:
+    category, reasons = self_merge_check.classify_category(["README.md"], "gptme/gptme")
+    assert category is None
+    assert any("spec-like" in r for r in reasons)
+
+
+def test_dot_slash_prefixed_root_readme_is_spec_like() -> None:
+    # GitHub API never produces ./-prefixed paths, but harden against it anyway.
+    assert self_merge_check.is_spec_like_doc("./README.md") is True
+    assert self_merge_check.is_spec_like_doc("./ARCHITECTURE.md") is True

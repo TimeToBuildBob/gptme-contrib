@@ -70,6 +70,7 @@ from pathlib import Path
 from typing import Any, cast
 
 MAX_GRAPHQL_PAGE_SIZE = 100
+DEFAULT_MIN_GREPTILE_SCORE = 5
 
 DOC_EXTENSIONS = {".md", ".rst", ".txt", ".adoc"}
 SPEC_LIKE_DOCS = {
@@ -100,6 +101,19 @@ SENSITIVE_PATH_PREFIXES = (
     "scripts/session_bandit",
     "scripts/state-delta",
     "scripts/state_delta",
+    # Loop-orchestration entrypoints: the control path that selects work and
+    # drives autonomous/monitoring runs (and can itself trigger self-merges).
+    # A change here can alter how the loop gates its own merges, so it must go
+    # through human review. Prefixes (no extension) catch hyphen/underscore and
+    # nested layouts: scripts/autonomous-run.sh, scripts/autonomous-run-cc.sh,
+    # scripts/runs/autonomous/autonomous-loop.sh, scripts/runs/github/project-monitoring.sh.
+    "scripts/autonomous-run",
+    "scripts/autonomous_run",
+    "scripts/autonomous-loop",
+    "scripts/autonomous_loop",
+    "scripts/runs/autonomous/",
+    "scripts/runs/github/project-monitoring",
+    "scripts/runs/github/project_monitoring",
     "infra/",
     "k8s/",
     "secrets/",
@@ -158,6 +172,8 @@ class CheckResult:
     reasons: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
+    # HEAD commit OID at time of check — callers should re-verify before merging
+    head_sha: str = ""
 
 
 def run_gh(args: list[str], timeout: int = 30) -> str:
@@ -180,6 +196,34 @@ def run_gh(args: list[str], timeout: int = 30) -> str:
 
 def get_gh_user() -> str:
     return run_gh(["api", "user", "-q", ".login"]) or ""
+
+
+@cache
+def merge_permission(repo: str) -> bool | None:
+    """Whether the authenticated user can merge PRs in ``repo``.
+
+    Returns True if the user has push/maintain/admin on the repo, False if they
+    explicitly lack it, or None if the permission could not be determined (gh
+    error / unexpected payload). None is treated as "unknown" by the caller —
+    a warning, not a disqualifier — so a transient API hiccup doesn't block a
+    legitimate self-merge. A definitive False does disqualify: it means the
+    merge attempt would fail with a permissions error (e.g. an agent that
+    contributes to an upstream repo via a fork has pull-only access).
+    """
+    raw = run_gh(["api", f"repos/{repo}", "-q", ".permissions"])
+    if not raw:
+        return None
+    try:
+        perms = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(perms, dict):
+        return None
+    # If none of the expected keys are present the payload shape is unexpected —
+    # treat as unknown so a future API schema change doesn't false-disqualify.
+    if not any(k in perms for k in ("push", "maintain", "admin")):
+        return None
+    return bool(perms.get("push") or perms.get("maintain") or perms.get("admin"))
 
 
 def _resolve_gate_helper(script_path: Path | None = None) -> str | None:
@@ -362,7 +406,14 @@ def parse_pr_target(
         if "#" in pr:
             repo_part, number_part = pr.split("#", 1)
             return repo_part, int(number_part)
-        raise ValueError(f"Unrecognized PR specifier: {pr}")
+        # Two-positional `owner/repo <number>` form: pr is the repo, the PR
+        # number was supplied as the separate positional argument.
+        if pr.count("/") == 1 and number is not None:
+            return pr, number
+        raise ValueError(
+            f"Unrecognized PR specifier: {pr!r}. "
+            f"Use a PR URL, 'owner/repo#number', or 'owner/repo <number>'."
+        )
     if repo and number is not None:
         return repo, number
     raise ValueError("Provide a PR URL/specifier or --repo with PR number")
@@ -414,7 +465,7 @@ def fetch_pr(repo: str, number: int) -> dict[str, Any]:
             "--repo",
             repo,
             "--json",
-            "number,title,url,author,statusCheckRollup,isDraft,state,reviewDecision",
+            "number,title,url,author,statusCheckRollup,isDraft,state,reviewDecision,headRefOid",
         ]
     )
     if not raw:
@@ -682,6 +733,13 @@ def checks_green(status_checks: list[dict[str, Any]]) -> bool:
     Returns True when no checks are configured (no CI), treating the
     absence of CI as neutral rather than failing. Individual checks with no
     status and no conclusion are treated as indeterminate, not passing.
+
+    Handles both check shapes in ``statusCheckRollup``:
+    - ``CheckRun`` (GitHub Actions) — result in ``status``/``conclusion``
+    - ``StatusContext`` (legacy commit statuses, e.g. ``codecov/patch``) —
+      result in ``state`` alone, with no ``status``/``conclusion``. Reading
+      only status/conclusion would treat a green StatusContext as
+      indeterminate and falsely flag CI as not green.
     """
     if not status_checks:
         return True
@@ -689,6 +747,12 @@ def checks_green(status_checks: list[dict[str, Any]]) -> bool:
     for check in status_checks:
         conclusion = (check.get("conclusion") or "").upper()
         status = (check.get("status") or "").upper()
+        state = (check.get("state") or "").upper()
+        # StatusContext entries carry their result in `state` alone.
+        if state and not status and not conclusion:
+            if state not in allowed:
+                return False
+            continue
         if not status and not conclusion:
             return False
         if status and status != "COMPLETED":
@@ -705,7 +769,15 @@ def is_doc_file(path: str) -> bool:
 
 
 def is_spec_like_doc(path: str) -> bool:
-    return Path(path).name in SPEC_LIKE_DOCS
+    """Spec-like identity docs (README/ARCHITECTURE/CLAUDE/…) require human review.
+
+    Only matches at the REPOSITORY ROOT. These filenames denote a project's
+    top-level identity/spec docs; a *nested* package README (e.g.
+    ``packages/foo/README.md``) is ordinary package documentation, not a spec,
+    and shouldn't block self-merge of an otherwise low-risk tooling PR.
+    """
+    normalized = path.replace("\\", "/").removeprefix("./")
+    return "/" not in normalized and Path(path).name in SPEC_LIKE_DOCS
 
 
 def is_test_file(path: str) -> bool:
@@ -967,6 +1039,52 @@ def _check_workspace_repo(
     return [], []
 
 
+def greptile_summary_score(repo: str, pr_number: int) -> int | None:
+    """Latest Greptile summary score via the shared greptile-merge-signal evaluator.
+
+    Returns the parsed score (0-5), or None if Greptile posted no parseable summary score.
+
+    Note on env-var precedence: this function only extracts the raw score from the
+    subprocess JSON. The floor comparison uses SELF_MERGE_MIN_GREPTILE_SCORE (parsed
+    by _parse_self_merge_min_greptile_score). The subprocess's own threshold
+    GREPTILE_MERGE_SIGNAL_MIN_SCORE has no effect on the gate — setting it does not
+    soften or tighten the floor here.
+    """
+    signal = Path(__file__).with_name("greptile-merge-signal.py")
+    if not signal.exists():
+        return None
+    try:
+        env = os.environ.copy()
+        # The self-merge gate owns its own enable/disable policy; don't let the
+        # standalone signal tool's disable flag silently neuter the floor.
+        env.pop("GREPTILE_MERGE_SIGNAL_DISABLED", None)
+        proc = subprocess.run(
+            [sys.executable, str(signal), "--repo", repo, str(pr_number)],
+            capture_output=True,
+            env=env,
+            text=True,
+            timeout=30,
+        )
+        data = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except (subprocess.TimeoutExpired, json.JSONDecodeError):
+        return None
+    score = data.get("score")
+    return int(score) if isinstance(score, int) else None
+
+
+def _parse_self_merge_min_greptile_score() -> int:
+    raw = os.environ.get("SELF_MERGE_MIN_GREPTILE_SCORE", "").strip()
+    if not raw:
+        return DEFAULT_MIN_GREPTILE_SCORE
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_MIN_GREPTILE_SCORE
+    if 0 <= value <= 5:
+        return value
+    return DEFAULT_MIN_GREPTILE_SCORE
+
+
 def evaluate_pr(
     repo: str, number: int, *, workspace_repos: list[str] | None
 ) -> CheckResult:
@@ -984,6 +1102,7 @@ def evaluate_pr(
         title=title,
         author=author,
         files=files,
+        head_sha=pr.get("headRefOid", ""),
     )
 
     current_user = get_gh_user()
@@ -999,6 +1118,23 @@ def evaluate_pr(
     )
     result.reasons.extend(cross_repo_reasons)
     result.warnings.extend(cross_repo_warnings)
+
+    # Merge-permission check: an allowlisted repo the agent cannot actually merge
+    # (pull-only access, e.g. an upstream repo contributed to via a fork) would
+    # otherwise report eligible=YES and then fail the merge with a GitHub
+    # permissions error. Disqualify on a definitive lack of permission; treat an
+    # indeterminate result (gh error) as a non-blocking warning.
+    can_merge = merge_permission(repo)
+    if can_merge is False:
+        result.reasons.append(
+            f"Authenticated user lacks merge permission on {repo} "
+            "(pull-only access; merge would fail). Open a PR for a maintainer to merge."
+        )
+    elif can_merge is None:
+        result.warnings.append(
+            f"Could not determine merge permission on {repo}; "
+            "merge may fail if access is pull-only."
+        )
 
     if pr.get("isDraft"):
         result.reasons.append("PR is still a draft")
@@ -1024,6 +1160,18 @@ def evaluate_pr(
         result.reasons.append(
             f"Greptile has {greptile['unresolved']} unresolved review thread(s)"
         )
+
+    # Score floor (defense in depth): require the Greptile summary score >= floor
+    # (default 5/5, override via SELF_MERGE_MIN_GREPTILE_SCORE). Without this, resolving
+    # threads alone could let a low-score PR self-merge — the alice#61 (4/5) and #63 (3/5)
+    # incidents where buggy control-path code shipped. Reuses the shared greptile-merge-signal
+    # evaluator (upstreamed from Bob). Parse failure (score None) does NOT block — the
+    # thread/category gates still apply; this only catches a clear sub-floor score.
+    if greptile["has_review"]:
+        min_score = _parse_self_merge_min_greptile_score()
+        score = greptile_summary_score(repo, number)
+        if score is not None and score < min_score:
+            result.reasons.append(f"Greptile score {score}/5 below floor {min_score}/5")
 
     human_threads = fetch_unresolved_human_threads(
         repo, number, review_data=shared_review_data
@@ -1096,7 +1244,10 @@ def main() -> int:
     )
     parser.add_argument("pr", nargs="?", help="PR URL, repo#num, or PR number")
     parser.add_argument(
-        "number", nargs="?", type=int, help="PR number when using --repo"
+        "number",
+        nargs="?",
+        type=int,
+        help="PR number when using --repo or 'owner/repo <number>' form",
     )
     parser.add_argument("--repo", help="Repository in owner/name form")
     parser.add_argument("--json", action="store_true", help="Output JSON")

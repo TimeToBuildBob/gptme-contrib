@@ -2,17 +2,8 @@
 match:
   keywords:
     - "structured monitoring triage workflow"
-    - "ACT vs DEF notification classification"
-    - "monitoring session derailing into investigation"
-    - "multi-project notification triage"
-    - "project monitoring session"
-    - "monitoring session structure"
-    - "time-box monitoring"
-    - "classify each notification"
-    - "github notifications triage"
     - "triage notifications across repos"
     - "monitoring run derailing"
-    - "act vs defer"
   session_categories: [monitoring, triage]
 status: active
 description: "Use systematic classification and time-boxed execution for monitoring sessions: classify notifications as ACT (action required) vs DEF (deferred), then execute only ACT items."

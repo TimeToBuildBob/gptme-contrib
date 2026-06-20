@@ -1,6 +1,8 @@
 """Tests for the Claude Code match-lessons hook."""
 
+import builtins
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -96,6 +98,49 @@ def test_scan_lessons_skips_readme(hook, tmp_path):
     result = hook.scan_lessons([lessons_dir])
     assert len(result) == 1
     assert result[0]["title"] == "Real"
+
+
+def test_scan_lessons_skips_node_modules(hook, tmp_path):
+    """Files under node_modules must not be included, even with valid frontmatter."""
+    lessons_dir = tmp_path / "skills"
+    lessons_dir.mkdir()
+    # A legitimate skill
+    (lessons_dir / "real-skill.md").write_text(
+        "---\nname: real-skill\ndescription: A real skill\nstatus: active\n---\n# Real Skill\n\nContent.\n"
+    )
+    # An npm package agent file — should be excluded
+    node_agents = (
+        lessons_dir / "my-tool" / "node_modules" / "playwright" / "lib" / "agents"
+    )
+    node_agents.mkdir(parents=True)
+    (node_agents / "playwright-test-generator.agent.md").write_text(
+        "---\nname: playwright-test-generator\ndescription: Use this agent to generate Playwright tests\n---\n# Generator\n\nContent.\n"
+    )
+    result = hook.scan_lessons([lessons_dir])
+    paths = [r["path"] for r in result]
+    assert all(
+        "node_modules" not in p for p in paths
+    ), f"node_modules file leaked into scan: {paths}"
+    assert len(result) == 1
+    assert result[0]["title"] == "Real Skill"
+
+
+def test_scan_lessons_skips_git_and_cache(hook, tmp_path):
+    """Files under .git / __pycache__ / .venv must not be included."""
+    lessons_dir = tmp_path / "lessons"
+    lessons_dir.mkdir()
+    (lessons_dir / "good.md").write_text(
+        '---\nmatch:\n  keywords:\n    - "good"\nstatus: active\n---\n# Good\n\nContent.\n'
+    )
+    for skip_dir in (".git", "__pycache__", ".venv"):
+        d = lessons_dir / skip_dir
+        d.mkdir()
+        (d / "hidden.md").write_text(
+            '---\nmatch:\n  keywords:\n    - "hidden"\nstatus: active\n---\n# Hidden\n\nContent.\n'
+        )
+    result = hook.scan_lessons([lessons_dir])
+    assert len(result) == 1
+    assert result[0]["title"] == "Good"
 
 
 def test_scan_lessons_dedup_by_filename(hook, tmp_path):
@@ -236,6 +281,69 @@ def test_extract_frontmatter_archived_excluded(hook, lesson_dir):
     lessons = hook.scan_lessons([lesson_dir])
     titles = [lesson["title"] for lesson in lessons]
     assert "Archived Lesson" not in titles
+
+
+def test_extract_frontmatter_regex_fallback_keeps_multiline_scalars(hook, monkeypatch):
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError
+        return real_import(name, *args, **kwargs)
+
+    # Remove yaml from the import cache so builtins.__import__ is actually called.
+    # Without this, `import yaml` inside extract_frontmatter resolves from sys.modules
+    # without invoking __import__, silently exercising the yaml path instead.
+    monkeypatch.delitem(sys.modules, "yaml", raising=False)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    content = (
+        "---\n"
+        "description: |\n"
+        "  First line.\n"
+        "  Second line.\n"
+        "when_to_use: >\n"
+        "  Use this skill\n"
+        "  when routing work.\n"
+        "---\n\n"
+        "# Title\n"
+    )
+
+    fm, _ = hook.extract_frontmatter(content)
+
+    assert fm["description"] == "First line.\nSecond line."
+    assert fm["when_to_use"] == "Use this skill when routing work."
+
+
+def test_scan_lessons_dedupes_top_level_keywords_and_patterns(hook, tmp_path):
+    lessons_dir = tmp_path / "lessons"
+    lessons_dir.mkdir()
+    (lessons_dir / "dedupe.md").write_text(
+        "---\n"
+        "match:\n"
+        '  keywords:\n    - "duplicate keyword"\n'
+        '  patterns:\n    - "duplicate.*pattern"\n'
+        'keywords: ["duplicate keyword", "extra keyword"]\n'
+        'patterns: ["duplicate.*pattern"]\n'
+        "status: active\n"
+        "---\n"
+        "# Dedupe\n"
+    )
+
+    lessons = hook.scan_lessons([lessons_dir])
+    assert lessons[0]["keywords"] == ["duplicate keyword", "extra keyword"]
+    assert lessons[0]["patterns"] == ["duplicate.*pattern"]
+
+    matches = hook.score_lessons(lessons, "duplicate keyword and duplicateXpattern")
+    assert matches[0]["matched_by"].count("duplicate keyword") == 1
+    assert matches[0]["matched_by"].count("pattern:duplicate.*pattern") == 1
+
+
+def test_detect_harness_defaults_to_gptme(hook, monkeypatch):
+    # No env vars set → fall back to gptme (the primary harness)
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    monkeypatch.delenv("CODEX", raising=False)
+    monkeypatch.delenv("CODEX_INSTALLED", raising=False)
+    assert hook.detect_harness() == "gptme"
 
 
 # --- build_pretool_match_text ---

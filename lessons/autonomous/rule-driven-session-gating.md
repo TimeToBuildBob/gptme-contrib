@@ -10,7 +10,10 @@ tags:
 - orchestration
 match:
   keywords:
-  - cost optimization
+    - "skip sessions when nothing to do"
+    - "lightweight check before spawning"
+    - "session gating"
+  session_categories: [autonomous, infrastructure]
 ---
 
 # Rule-Driven Session Gating for Monitoring Agents

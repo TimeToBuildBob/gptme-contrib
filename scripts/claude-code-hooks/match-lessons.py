@@ -76,6 +76,83 @@ MIN_PREDICTION_LIFT = 2.0
 MIN_PREDICTION_TS = 0.30
 # State directory for cross-invocation dedup (in /tmp, not workspace)
 STATE_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "claude-lesson-match"
+# Directories inside lesson dirs that should never be scanned for lessons.
+# node_modules: npm packages (e.g. Playwright) ship *.agent.md skill files
+# that get injected as harmful lessons when they match on keywords.
+_SKIP_DIR_PARTS = frozenset({"node_modules", ".git", "__pycache__", ".venv"})
+_SHORT_DESCRIPTOR_TOKENS = {
+    "ai",
+    "api",
+    "ci",
+    "cli",
+    "css",
+    "gui",
+    "html",
+    "json",
+    "llm",
+    "pr",
+    "ui",
+    "ux",
+    "vm",
+    "xml",
+    "yaml",
+}
+_DESCRIPTOR_STOPWORDS = {
+    "about",
+    "after",
+    "agent",
+    "agents",
+    "and",
+    "any",
+    "are",
+    "before",
+    "build",
+    "can",
+    "code",
+    "debug",
+    "does",
+    "for",
+    "from",
+    "get",
+    "how",
+    "into",
+    "just",
+    "make",
+    "need",
+    "only",
+    "other",
+    "our",
+    "out",
+    "over",
+    "process",
+    "project",
+    "run",
+    "set",
+    "should",
+    "task",
+    "than",
+    "that",
+    "the",
+    "their",
+    "them",
+    "there",
+    "these",
+    "this",
+    "those",
+    "through",
+    "tool",
+    "tools",
+    "use",
+    "used",
+    "using",
+    "when",
+    "where",
+    "which",
+    "with",
+    "work",
+    "your",
+}
+_DESCRIPTOR_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_/-]*")
 
 
 # --- Workspace discovery (all state paths derived from here) ---
@@ -186,6 +263,66 @@ def match_keyword(keyword: str, text_lower: str) -> bool:
     return bool(pattern.search(text_lower))
 
 
+def _extract_scalar_frontmatter_field(fm_str: str, field: str) -> str | None:
+    """Extract a simple top-level YAML scalar or block scalar without PyYAML."""
+    lines = fm_str.splitlines()
+    field_pattern = re.compile(rf"^{re.escape(field)}:\s*(.*)$")
+
+    for index, line in enumerate(lines):
+        match = field_pattern.match(line)
+        if not match:
+            continue
+
+        raw_value = match.group(1).strip()
+        if raw_value and raw_value[0] in "|>":
+            block_lines: list[str] = []
+            for next_line in lines[index + 1 :]:
+                if next_line and not next_line.startswith((" ", "\t")):
+                    break
+                block_lines.append(next_line)
+
+            if not block_lines:
+                return ""
+
+            indents = [
+                len(block_line) - len(block_line.lstrip(" "))
+                for block_line in block_lines
+                if block_line.strip()
+            ]
+            trim = min(indents) if indents else 0
+            normalized = [
+                block_line[trim:] if trim else block_line for block_line in block_lines
+            ]
+            text = "\n".join(normalized).strip()
+            if raw_value[0] == ">":
+                return " ".join(
+                    part.strip() for part in text.splitlines() if part.strip()
+                )
+            return text
+
+        value = raw_value
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value.strip()
+
+    return None
+
+
+def _dedupe_strings(values: list[object]) -> list[str]:
+    """Strip and deduplicate strings while preserving first-seen order."""
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        cleaned = value.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        deduped.append(cleaned)
+    return deduped
+
+
 def extract_frontmatter(content: str) -> tuple[dict[str, object], str]:
     """Extract YAML frontmatter and body from markdown."""
     if not content.startswith("---"):
@@ -227,11 +364,84 @@ def extract_frontmatter(content: str) -> tuple[dict[str, object], str]:
     if m:
         fm["status"] = m.group(1)
 
-    name_m = re.search(r"^name:\s*(.+)$", fm_str, re.MULTILINE)
-    if name_m:
-        fm["name"] = name_m.group(1).strip()
+    for field in ("name", "description", "when_to_use"):
+        value = _extract_scalar_frontmatter_field(fm_str, field)
+        if value is not None:
+            fm[field] = value
 
     return fm, body
+
+
+def _string_list(value: object) -> list[str]:
+    """Normalize YAML string-or-list fields into a clean list."""
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _descriptor_tokens(text: str) -> set[str]:
+    """Tokenize routing descriptors from skill name/description/tags."""
+    tokens: set[str] = set()
+    for raw in _DESCRIPTOR_TOKEN_RE.findall(text.lower()):
+        for part in re.split(r"[-_/]", raw):
+            token = part.strip()
+            if not token:
+                continue
+            if len(token) < 3 and token not in _SHORT_DESCRIPTOR_TOKENS:
+                continue
+            if token not in _DESCRIPTOR_STOPWORDS:
+                tokens.add(token)
+            # Strip trailing "s" for simple plurals, but skip false positives
+            # where the singular is implausibly short or the ending strongly
+            # suggests an irregular/non-plural form (e.g. "status", "access").
+            if (
+                token.endswith("s")
+                and len(token) > 4
+                and not token.endswith("ss")  # "class", "access", "process"
+                and not token.endswith("us")  # "status", "focus"
+                and not token.endswith("is")  # "analysis", "basis"
+            ):
+                singular = token[:-1]
+                if len(singular) >= 3 and singular not in _DESCRIPTOR_STOPWORDS:
+                    tokens.add(singular)
+    return tokens
+
+
+def _score_skill_descriptor(lesson: dict, prompt_lower: str) -> tuple[float, list[str]]:
+    """Score skill routing metadata against prompt text."""
+    if not lesson.get("is_skill"):
+        return 0.0, []
+
+    prompt_tokens = _descriptor_tokens(prompt_lower)
+    if not prompt_tokens:
+        return 0.0, []
+
+    skill_name = str(lesson.get("skill_name") or "")
+    routing_text = str(lesson.get("when_to_use") or lesson.get("description") or "")
+    tags = [str(tag).strip() for tag in lesson.get("tags") or [] if str(tag).strip()]
+
+    name_overlap = prompt_tokens & _descriptor_tokens(skill_name)
+    description_overlap = prompt_tokens & _descriptor_tokens(routing_text)
+    tag_overlap = prompt_tokens & _descriptor_tokens(" ".join(tags))
+    total_overlap = name_overlap | description_overlap | tag_overlap
+
+    if len(total_overlap) < 2:
+        return 0.0, []
+
+    score = 0.0
+    matched_by: list[str] = []
+    if name_overlap:
+        score += min(1.2, 0.6 * len(name_overlap))
+        matched_by.append(f"name:{','.join(sorted(name_overlap)[:3])}")
+    if description_overlap:
+        score += min(1.2, 0.35 * len(description_overlap))
+        matched_by.append(f"description:{','.join(sorted(description_overlap)[:4])}")
+    if tag_overlap:
+        score += min(0.9, 0.45 * len(tag_overlap))
+        matched_by.append(f"tags:{','.join(sorted(tag_overlap)[:3])}")
+    return score, matched_by
 
 
 def scan_lessons(lesson_dirs: list[Path]) -> list[dict]:
@@ -253,11 +463,36 @@ def scan_lessons(lesson_dirs: list[Path]) -> list[dict]:
             if f.name == "README.md":
                 continue
 
+            # Skip files inside tool/cache directories — not lesson content.
+            if _SKIP_DIR_PARTS & set(f.relative_to(lesson_dir).parts):
+                continue
+
             # Dedup by resolved path (handles symlinks across dirs)
             resolved = str(f.resolve())
             if resolved in seen_paths:
                 continue
             seen_paths.add(resolved)
+
+            # Skip archived lessons — but still register their name so that
+            # contrib copies are also suppressed (local archive wins over contrib).
+            # Use relative_to(lesson_dir) so parent path segments (e.g. a workspace
+            # living under /home/alice/archive/…) don't trigger false suppression.
+            if "archive" in f.relative_to(lesson_dir).parts:
+                if f.name != "SKILL.md":
+                    # Only suppress if no active (non-archived) copy exists in this
+                    # lesson_dir. Lexicographic sort puts archive/foo.md before foo.md
+                    # so naively registering here would suppress the active copy.
+                    active_copy = next(
+                        (
+                            p
+                            for p in lesson_dir.rglob(f.name)
+                            if "archive" not in p.relative_to(lesson_dir).parts
+                        ),
+                        None,
+                    )
+                    if active_copy is None:
+                        seen_names.add(f.name)
+                continue
 
             # Dedup by filename (first lesson dir wins — local overrides contrib).
             # Exception: SKILL.md files are always different skills, not duplicates.
@@ -286,14 +521,28 @@ def scan_lessons(lesson_dirs: list[Path]) -> list[dict]:
 
             if isinstance(raw_keywords, str):
                 raw_keywords = [raw_keywords]
-            keywords = [k for k in raw_keywords if isinstance(k, str) and k.strip()]
+            keywords = _dedupe_strings(
+                [*raw_keywords, *_string_list(fm.get("keywords"))]
+            )
 
             if isinstance(raw_patterns, str):
                 raw_patterns = [raw_patterns]
-            patterns = [p for p in raw_patterns if isinstance(p, str) and p.strip()]
+            patterns = _dedupe_strings(
+                [*raw_patterns, *_string_list(fm.get("patterns"))]
+            )
 
             skill_name = fm.get("name") if isinstance(fm.get("name"), str) else None
             lesson_id = fm.get("id") if isinstance(fm.get("id"), str) else None
+            description = (
+                fm.get("description") if isinstance(fm.get("description"), str) else ""
+            )
+            when_to_use = (
+                fm.get("when_to_use") if isinstance(fm.get("when_to_use"), str) else ""
+            )
+            metadata_value = fm.get("metadata")
+            metadata = metadata_value if isinstance(metadata_value, dict) else {}
+            tags = _string_list(metadata.get("tags"))
+            harness_restrict = _string_list(metadata.get("harness"))
 
             # Need at least some way to match
             if not keywords and not patterns and not skill_name:
@@ -311,11 +560,39 @@ def scan_lessons(lesson_dirs: list[Path]) -> list[dict]:
                     "keywords": keywords,
                     "patterns": patterns,
                     "skill_name": skill_name,
+                    "description": description,
+                    "when_to_use": when_to_use,
+                    "tags": tags,
+                    "harness_restrict": harness_restrict,
+                    "is_skill": f.name == "SKILL.md" or skill_name is not None,
                     "body": body,
                     "n_keywords": len(keywords),
                 }
             )
     return lessons
+
+
+def detect_harness() -> str:
+    """Detect the current runtime harness for lesson applicability filters."""
+    if os.environ.get("CLAUDECODE"):
+        return "claude-code"
+    if os.environ.get("CODEX") or os.environ.get("CODEX_INSTALLED"):
+        return "codex"
+    return "gptme"
+
+
+def filter_by_harness(lessons: list[dict], harness: str) -> list[dict]:
+    """Keep unrestricted lessons and lessons explicitly allowed for harness."""
+    filtered = []
+    for lesson in lessons:
+        restrict = lesson.get("harness_restrict") or []
+        if not restrict:
+            filtered.append(lesson)
+            continue
+        allowed = {str(value).strip() for value in restrict if str(value).strip()}
+        if harness in allowed:
+            filtered.append(lesson)
+    return filtered
 
 
 # --- Thompson sampling ---
@@ -546,6 +823,13 @@ def score_lessons(lessons: list[dict], prompt: str, max_results: int = 5) -> lis
                     score += 1.5
                     matched_by.append(f"skill:{lesson['skill_name']}")
                     break
+
+        descriptor_score, descriptor_matches = _score_skill_descriptor(
+            lesson, prompt_lower
+        )
+        if descriptor_score > 0:
+            score += descriptor_score
+            matched_by.extend(descriptor_matches)
 
         if score > 0:
             results.append({**lesson, "score": score, "matched_by": matched_by})
@@ -992,6 +1276,7 @@ def main():
     workspace = get_workspace()
     lesson_dirs = load_lesson_dirs(workspace)
     lessons = scan_lessons(lesson_dirs)
+    lessons = filter_by_harness(lessons, detect_harness())
     holdout_lessons = parse_holdout_lessons_env()
 
     if not lessons:
