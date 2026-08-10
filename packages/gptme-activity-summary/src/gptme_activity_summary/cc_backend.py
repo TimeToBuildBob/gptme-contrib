@@ -7,6 +7,7 @@ This provides better quality summaries and saves tokens in the main gptme sessio
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -19,6 +20,40 @@ logger = logging.getLogger(__name__)
 # Retry configuration for empty CC responses (nesting detection, transient failures)
 _MAX_RETRIES = 3
 _RETRY_DELAY_S = 5
+_DEFAULT_FALLBACK_MODEL = "openai-subscription/gpt-5.6-sol"
+_QUOTA_FAILURE_MARKERS = (
+    "hit your weekly limit",
+    "weekly limit reached",
+)
+
+
+def _is_quota_failure(stdout: str, stderr: str) -> bool:
+    combined = f"{stdout}\n{stderr}".lower()
+    return any(marker in combined for marker in _QUOTA_FAILURE_MARKERS)
+
+
+def _call_gptme_fallback(prompt: str, model: str, timeout: int) -> str:
+    """Generate with a non-Claude gptme model after a permanent quota failure."""
+    result = subprocess.run(
+        [
+            "gptme-util",
+            "llm",
+            "generate",
+            "--model",
+            model,
+            "--no-stream",
+        ],
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=os.environ.copy(),
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, result.args, result.stdout, result.stderr
+        )
+    return result.stdout.strip()
 
 
 def call_claude_code(
@@ -26,6 +61,7 @@ def call_claude_code(
     timeout: int = 120,
     max_retries: int = _MAX_RETRIES,
     diagnostic_dir: Path | None = None,
+    fallback_model: str | None = None,
 ) -> str:
     """
     Call Claude Code CLI with a prompt, retrying on non-zero exit or empty responses.
@@ -40,6 +76,9 @@ def call_claude_code(
         max_retries: Maximum number of retry attempts per failure type
         diagnostic_dir: Directory for Claude debug logs. Defaults to a stable
             temporary directory so scheduled failures retain diagnostics.
+        fallback_model: gptme model used when Claude reports a permanent quota
+            cap. Defaults to ``GPTME_ACTIVITY_SUMMARY_FALLBACK_MODEL`` or the
+            OpenAI subscription model used by Bob's autonomous runtime.
 
     Returns:
         The response text from Claude Code
@@ -48,9 +87,9 @@ def call_claude_code(
         subprocess.TimeoutExpired: If the command times out
         subprocess.CalledProcessError: If non-zero exit persists after all retries
     """
-    import os
-
     env = os.environ.copy()
+    if fallback_model is None:
+        fallback_model = env.get("GPTME_ACTIVITY_SUMMARY_FALLBACK_MODEL", _DEFAULT_FALLBACK_MODEL)
     # Allow nesting: unset all CC env vars. Historically we also passed
     # --no-session-persistence unconditionally, but for non-nested callers that
     # prevents CC from writing a full trajectory to ~/.claude/projects/. Only
@@ -120,6 +159,13 @@ def call_claude_code(
             env=env,
         )
         if result.returncode != 0:
+            if fallback_model and _is_quota_failure(result.stdout, result.stderr):
+                logger.warning(
+                    "claude -p hit a permanent quota cap; falling back to %s",
+                    fallback_model,
+                )
+                return _call_gptme_fallback(prompt, fallback_model, timeout)
+
             # If --debug-file is not supported by this claude build, the flag itself
             # can turn a recoverable transient failure into a permanent one. Detect
             # by looking for the flag name in error output and disable for future retries.

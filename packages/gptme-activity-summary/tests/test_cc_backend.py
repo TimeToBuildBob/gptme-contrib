@@ -4,6 +4,8 @@ import subprocess
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import pytest
+
 from gptme_activity_summary.cc_backend import (
     call_claude_code,
     extract_json_from_response,
@@ -180,6 +182,54 @@ def test_call_claude_code_nonzero_then_success(mock_run, mock_sleep):
     assert result == '{"ok": true}'
     assert mock_run.call_count == 2
     mock_sleep.assert_called_once()
+
+
+@patch("gptme_activity_summary.cc_backend.time.sleep")
+@patch("subprocess.run")
+def test_call_claude_code_quota_failure_falls_back_to_gptme(mock_run, mock_sleep):
+    """A permanent Claude quota cap should use the configured gptme fallback."""
+    mock_run.side_effect = [
+        _make_completed_process(
+            returncode=1,
+            stdout="You've hit your weekly limit · resets Aug 11, 6pm (UTC)",
+        ),
+        _make_completed_process(stdout='{"ok": true}'),
+    ]
+
+    result = call_claude_code(
+        "test prompt",
+        max_retries=3,
+        fallback_model="openai-subscription/gpt-5.6-sol",
+    )
+
+    assert result == '{"ok": true}'
+    assert mock_run.call_count == 2
+    assert mock_run.call_args_list[1].args[0] == [
+        "gptme-util",
+        "llm",
+        "generate",
+        "--model",
+        "openai-subscription/gpt-5.6-sol",
+        "--no-stream",
+    ]
+    assert mock_sleep.call_count == 0
+
+
+@patch("gptme_activity_summary.cc_backend.time.sleep")
+@patch("subprocess.run")
+def test_call_claude_code_fallback_failure_raises(mock_run, mock_sleep):
+    """A failed fallback must remain visible instead of becoming empty output."""
+    mock_run.side_effect = [
+        _make_completed_process(returncode=1, stdout="You've hit your weekly limit"),
+        _make_completed_process(returncode=2, stderr="fallback unavailable"),
+    ]
+
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        call_claude_code("test prompt", fallback_model="openai/test")
+
+    assert error.value.returncode == 2
+    assert error.value.stderr == "fallback unavailable"
+    assert mock_sleep.call_count == 0
 
 
 @patch("gptme_activity_summary.cc_backend.time.sleep")
