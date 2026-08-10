@@ -253,7 +253,7 @@ _LOCAL_FIX_SECTIONS = {
         "1. Push fixes, then close the loop on every finding as described above\n"
         "2. Run `POLL_BUDGET_SEC={poll_budget_sec} bash {pr_address_script} --repo {repo} {number}`\n"
         "   - Exit 0: merged — done\n"
-        "   - Exit 2: Greptile re-reviewed and found new issues — read the new unresolved threads, fix them, push, reply, then re-run the command once more\n"
+        "   - Exit 2: Greptile re-reviewed and found new issues — read the new unresolved threads, fix them, push, close their threads, then re-run the command once more\n"
         "   - Exit 3: poll budget exhausted without Greptile re-review completing — stop; next monitoring cycle will continue"
     ),
     # NOTE(parity): the local variant never mentions the greptile-helper —

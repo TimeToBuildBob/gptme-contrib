@@ -65,7 +65,7 @@ worse than leaving a thread open.
 1. Push fixes, then close the loop on every finding as described above
 2. Run `POLL_BUDGET_SEC=1800 bash /home/bob/bob/scripts/github/pr-address-wait-and-merge.sh --repo gptme/gptme-contrib 1234`
    - Exit 0: merged — done
-   - Exit 2: Greptile re-reviewed and found new issues — read the new unresolved threads, fix them, push, reply, then re-run the command once more
+   - Exit 2: Greptile re-reviewed and found new issues — read the new unresolved threads, fix them, push, close their threads, then re-run the command once more
    - Exit 3: poll budget exhausted without Greptile re-review completing — stop; next monitoring cycle will continue
 
 ⚠️ **If you cannot fix the findings, do NOT re-trigger Greptile and do NOT call pr-address-wait-and-merge.sh.**
