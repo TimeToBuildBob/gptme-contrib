@@ -399,6 +399,15 @@ def test_voice_postcall_explicit_negative_branch() -> None:
         "voice_postcall negative branch must exit non-zero so status-aware callers "
         "treat a missing terminal row as failure, not success"
     )
+    # The failure message must include the searched record path so a worker (or
+    # human) can distinguish a genuine missing terminal row from a missing
+    # record= token in the detail.  BOB_PARAMS has no record= token, so the
+    # sentinel appears; a real detail would show the actual path.
+    assert "searched for:" in rendered, (
+        "voice_postcall failure message does not include the searched record path — "
+        "add '(searched for: \\'{record_path}\\')' to the echo so sentinel vs genuine "
+        "failures are distinguishable"
+    )
 
 
 def test_voice_postcall_record_path_substituted() -> None:
@@ -504,8 +513,8 @@ def test_voice_postcall_letter_key_in_detail_is_separator() -> None:
     test_voice_postcall_digit_key_in_path_not_truncated: letter-starting keys
     like 'event_type=' MUST stop the capture so the rendered grep -F uses only
     the record path, not the subsequent key=value pair.  Changing the lookahead
-    from [a-z][a-z0-9_]*= to \\w+= (or removing it) would pass the digit-key
-    test while silently breaking this one.
+    from [A-Za-z][A-Za-z0-9_]*= to \\w+= (or removing it) would pass the
+    digit-key test while silently breaking this one.
     """
     params_with_event_type = ItemPromptParams(
         repo="gptme/gptme-contrib",
@@ -525,6 +534,37 @@ def test_voice_postcall_letter_key_in_detail_is_separator() -> None:
     assert "event_type" not in rendered.split("grep -F")[1].split("\n")[0], (
         "letter-starting key 'event_type' leaked into the extracted record path "
         "or the grep command line — path must stop before the detail token"
+    )
+    assert "__RECORD_PATH_MISSING__" not in rendered
+
+
+def test_voice_postcall_uppercase_key_in_detail_is_separator() -> None:
+    """Regression: uppercase-initial key=value tokens must also terminate path capture.
+
+    The lookahead (?=\\s+[A-Za-z][A-Za-z0-9_]*=|\\s*$) covers both lower and
+    upper case initial letters.  A narrower (?=\\s+[a-z][a-z0-9_]*=|\\s*$)
+    would absorb 'EventType=terminal' into the path, producing a grep -F
+    with a trailing ' EventType=terminal' that never matches a TSV line and
+    falsely reports verification FAILED on a valid completed call.
+    """
+    params_with_upper_key = ItemPromptParams(
+        repo="gptme/gptme-contrib",
+        number=1234,
+        detail="greptile_needs_improvement record=/tmp/voice-2026-01-01T12-00-00.wav EventType=terminal",
+        all_numbers=("1234",),
+        **BOB_IDENTITY,
+    )
+    rendered = render_item_investigate(
+        ItemPromptKind("voice_postcall"), params_with_upper_key
+    )
+    assert "grep -F '/tmp/voice-2026-01-01T12-00-00.wav'" in rendered, (
+        "voice_postcall failed to stop path capture at uppercase-initial token 'EventType=' — "
+        "the regex lookahead must use [A-Za-z][A-Za-z0-9_]*= to treat both lower and upper "
+        "case initial keys as separators"
+    )
+    assert "EventType" not in rendered.split("grep -F")[1].split("\n")[0], (
+        "uppercase-initial key 'EventType' leaked into the extracted record path — "
+        "path capture must stop before any letter-starting key=value token"
     )
     assert "__RECORD_PATH_MISSING__" not in rendered
 

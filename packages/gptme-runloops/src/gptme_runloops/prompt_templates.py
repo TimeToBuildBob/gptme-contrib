@@ -602,13 +602,14 @@ class ItemPromptParams:
         Single quotes in the path are escaped for shell single-quoted context so
         the rendered grep -F '...' command is always syntactically valid.
 
-        Separator logic: letter-starting tokens (e.g. 'event_type=') stop the
-        capture; digit-starting substrings (e.g. '2026=') inside the path do
-        not.  Paths containing a space followed by a letter-starting 'word='
-        pattern are unsupported — by convention, voice-call paths use ISO
-        timestamps with hyphens and never contain such sequences.
+        Separator logic: letter-starting tokens — lower or upper case (e.g.
+        'event_type=', 'EventType=') — stop the capture; digit-starting
+        substrings (e.g. '2026=') inside the path do not.  Paths containing a
+        space followed by a letter-starting 'word=' pattern are unsupported —
+        by convention, voice-call paths use ISO timestamps with hyphens and
+        never contain such sequences.
         """
-        m = re.search(r"\brecord=(.+?)(?=\s+[a-z][a-z0-9_]*=|\s*$)", self.detail)
+        m = re.search(r"\brecord=(.+?)(?=\s+[A-Za-z][A-Za-z0-9_]*=|\s*$)", self.detail)
         if not m:
             return "__RECORD_PATH_MISSING__"
         return m.group(1).replace("'", "'\\''")
@@ -907,7 +908,7 @@ It is idempotent — re-running on a completed record is harmless.
 After the worker finishes, verify the trace ledger shows a terminal row for this record:
 ```bash
 rows=$(grep -E '{stem}' "{workspace}/state/voice-calls/post-call-events.tsv" | grep -F '{record_path}' | tail -3)
-[ -n "$rows" ] && printf '%s\n' "$rows" || { echo "NO TERMINAL ROW — verification FAILED"; exit 1; }
+[ -n "$rows" ] && printf '%s\n' "$rows" || { echo "NO TERMINAL ROW — verification FAILED (searched for: '{record_path}')"; exit 1; }
 ```
 """
 
