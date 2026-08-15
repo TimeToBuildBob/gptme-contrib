@@ -7,7 +7,9 @@ This provides better quality summaries and saves tokens in the main gptme sessio
 
 import json
 import logging
+import os
 import re
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -19,6 +21,54 @@ logger = logging.getLogger(__name__)
 # Retry configuration for empty CC responses (nesting detection, transient failures)
 _MAX_RETRIES = 3
 _RETRY_DELAY_S = 5
+_FALLBACK_MODEL = "openai/gpt-5.4"
+_CLAUDE_WEEKLY_LIMIT_RE = re.compile(
+    r"(?:hit|reached|exceeded).{0,40}weekly limit|weekly limit.{0,40}resets",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_claude_weekly_limit(text: str) -> bool:
+    """Return True for the permanent Claude weekly-cap message."""
+    return bool(_CLAUDE_WEEKLY_LIMIT_RE.search(text))
+
+
+def _call_gptme_util_generate(prompt: str, timeout: int) -> str:
+    """Fallback to gptme-util's provider-backed raw generation path."""
+    model = os.environ.get("GPTME_ACTIVITY_SUMMARY_FALLBACK_MODEL", _FALLBACK_MODEL)
+    base_cmd = shlex.split(os.environ.get("GPTME_ACTIVITY_SUMMARY_FALLBACK_CMD", "gptme-util"))
+    cmd = [
+        *base_cmd,
+        "llm",
+        "generate",
+        "-m",
+        model,
+        "--no-stream",
+        "--output-format",
+        "text",
+        "--system",
+        "Return only valid JSON. Do not include markdown fences or commentary.",
+        "--temperature",
+        "0.2",
+        "--max-tokens",
+        "4000",
+    ]
+    result = subprocess.run(
+        cmd,
+        input=prompt,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "gptme-util fallback exited %d. stderr: %s; stdout: %s",
+            result.returncode,
+            result.stderr.strip()[:500] if result.stderr else "(none)",
+            result.stdout.strip()[:500] if result.stdout else "(none)",
+        )
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+    return result.stdout.strip()
 
 
 def call_claude_code(
@@ -151,6 +201,13 @@ def call_claude_code(
                 else:
                     attempt += 1
                 continue
+            combined_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+            if _is_claude_weekly_limit(combined_output):
+                logger.warning(
+                    "claude -p hit weekly limit after %d attempts; falling back to gptme-util llm generate",
+                    max_retries,
+                )
+                return _call_gptme_util_generate(prompt, timeout=timeout)
             raise subprocess.CalledProcessError(
                 result.returncode, attempt_cmd, result.stdout, result.stderr
             )

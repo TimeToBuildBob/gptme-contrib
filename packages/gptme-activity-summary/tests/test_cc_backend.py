@@ -170,6 +170,38 @@ def test_call_claude_code_nonzero_exit_raises_after_retries(mock_run, mock_sleep
 
 @patch("gptme_activity_summary.cc_backend.time.sleep")
 @patch("subprocess.run")
+def test_call_claude_code_weekly_limit_uses_gptme_util_fallback(mock_run, mock_sleep, monkeypatch):
+    """Permanent Claude weekly caps should fall back to provider-backed gptme-util."""
+    monkeypatch.setenv("GPTME_ACTIVITY_SUMMARY_FALLBACK_MODEL", "openai/gpt-4o-mini")
+    mock_run.side_effect = [
+        _make_completed_process(
+            returncode=1,
+            stdout="You've hit your weekly limit · resets Aug 18, 6pm (UTC)",
+        ),
+        _make_completed_process(
+            returncode=1,
+            stdout="You've hit your weekly limit · resets Aug 18, 6pm (UTC)",
+        ),
+        _make_completed_process(
+            returncode=1,
+            stdout="You've hit your weekly limit · resets Aug 18, 6pm (UTC)",
+        ),
+        _make_completed_process(stdout='{"ok": true}'),
+    ]
+
+    result = call_claude_code("test prompt", max_retries=3)
+
+    assert result == '{"ok": true}'
+    assert mock_run.call_count == 4
+    fallback_cmd = mock_run.call_args_list[-1].args[0]
+    assert fallback_cmd[:3] == ["gptme-util", "llm", "generate"]
+    assert fallback_cmd[fallback_cmd.index("-m") + 1] == "openai/gpt-4o-mini"
+    assert mock_run.call_args_list[-1].kwargs["input"] == "test prompt"
+    assert mock_sleep.call_count == 2
+
+
+@patch("gptme_activity_summary.cc_backend.time.sleep")
+@patch("subprocess.run")
 def test_call_claude_code_nonzero_then_success(mock_run, mock_sleep):
     """Test retry after non-zero exit eventually succeeds."""
     mock_run.side_effect = [
