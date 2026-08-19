@@ -81,7 +81,7 @@ def _repo_is_excluded(repo: str, patterns: tuple[str, ...] | None = None) -> boo
 
     if patterns is None:
         patterns = _get_excluded_repo_patterns()
-    return any(fnmatch.fnmatch(repo, pat) for pat in patterns)
+    return any(fnmatch.fnmatch(repo.lower(), pat.lower()) for pat in patterns)
 
 
 # Repositories that receive automated shadow PR reviews (no Greptile free tier).
@@ -713,11 +713,15 @@ class LaneDispatcher:
         if fast_model is None:
             fast_model = os.environ.get("BOB_PM_FAST_LANE_MODEL") or None
         _exclude_patterns = _get_excluded_repo_patterns()
+        all_items = list(items)
         items = [
             item
-            for item in items
+            for item in all_items
             if not _repo_is_excluded(item.repo, _exclude_patterns)
         ]
+        skipped_excluded = len(all_items) - len(items)
+        if skipped_excluded:
+            logger.info("dispatch: skipped %d excluded-repo item(s)", skipped_excluded)
         fast_items, slow_items = partition_items(items)
 
         launched = 0

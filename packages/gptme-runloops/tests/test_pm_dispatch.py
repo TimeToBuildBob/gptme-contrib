@@ -2354,6 +2354,12 @@ class TestRepoExclusionList:
     def test_repo_is_excluded_empty_patterns(self):
         assert not _repo_is_excluded("ActivityWatch/aw-webui", ())
 
+    def test_repo_is_excluded_case_insensitive(self):
+        # GitHub repo names are case-insensitive; pattern and repo may differ in casing
+        assert _repo_is_excluded("activitywatch/aw-webui", ("ActivityWatch/*",))
+        assert _repo_is_excluded("ActivityWatch/aw-webui", ("activitywatch/*",))
+        assert _repo_is_excluded("ACTIVITYWATCH/AW-WEBUI", ("ActivityWatch/*",))
+
     def test_get_excluded_repo_patterns_default(self, monkeypatch):
         monkeypatch.delenv(PM_DISPATCH_EXCLUDE_REPOS_ENV, raising=False)
         patterns = _get_excluded_repo_patterns()
