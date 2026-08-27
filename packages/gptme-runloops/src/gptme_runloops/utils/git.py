@@ -41,8 +41,10 @@ def git_pull_with_retry(
         logger: Optional logger for messages
 
     Returns:
-        True if the fast-forward succeeded or there was nothing to pull,
-        False otherwise
+        True if the fast-forward succeeded, there was nothing to pull,
+        or the fast-forward was refused because of local uncommitted changes
+        (safe skip — nothing was clobbered).
+        False only if the fetch failed after all retries (network error).
     """
 
     def log(msg: str) -> None:
