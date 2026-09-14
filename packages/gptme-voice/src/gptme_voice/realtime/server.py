@@ -2443,15 +2443,13 @@ class VoiceServer:
         if from_number:
             custom_params["from_number"] = from_number
             custom_params["remote_party"] = from_number
-            # Body tools on /twilio must not trust client-supplied from_number.
-            # Mint a call-scoped grant here only after signature validation, and
-            # bind it to CallSid (kept off TwiML so a stolen grant cannot be
-            # replayed onto a different start event).
-            if (
-                signature_validated
-                and incoming_call_sid
-                and self._twilio_body_caller_allowed(from_number)
-            ):
+            # /twilio must not trust client-supplied from_number. Mint a
+            # call-scoped grant after signature validation and bind it to
+            # CallSid (kept off TwiML so a stolen grant cannot be replayed
+            # onto a different start event). This token proves the From was
+            # signed, not that body/RAG tools are authorized — those still
+            # check TWILIO_CALLER_ALLOWLIST separately.
+            if signature_validated and incoming_call_sid:
                 grant_token = self._mint_twilio_body_grant(
                     from_number, incoming_call_sid
                 )
@@ -2605,8 +2603,11 @@ class VoiceServer:
                     # attacker-controlled on /twilio.
                     if (
                         prewarm_eligible
-                        and self._twilio_body_caller_allowed(from_number)
                         and granted_from is None
+                        and (
+                            self._twilio_body_caller_allowed(from_number)
+                            or self._prewarm_inbound_trusted.get(from_number)
+                        )
                     ):
                         prewarm_eligible = False
                     prewarm_client = (

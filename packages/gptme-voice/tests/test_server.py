@@ -1071,6 +1071,84 @@ def test_twilio_spoof_cannot_steal_body_capable_prewarm(
     assert claimed == []
 
 
+def test_twilio_spoof_cannot_steal_trusted_standup_prewarm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spoofed /twilio start must not claim a prewarm that loaded standup context.
+
+    Even with no caller allowlist and no body adapter, a signature-validated
+    inbound may have already injected the operator standup brief into the
+    prewarm. Claiming it from customParameters.from_number alone would leak
+    that plan to an unauthenticated WebSocket.
+    """
+    import gptme_voice.realtime.server as server_mod
+
+    real_get = server_mod._get_config_env
+
+    def fake_get(name: str) -> str | None:
+        if name == "TWILIO_CALLER_ALLOWLIST":
+            return None
+        return real_get(name)
+
+    monkeypatch.setattr(server_mod, "_get_config_env", fake_get)
+
+    claimed: list[str] = []
+
+    async def _exercise() -> None:
+        server = VoiceServer()
+        server._prewarm_inbound_trusted["+15551212"] = True
+        websocket = _DummyTwilioWebSocket(
+            [
+                {"event": "connected"},
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "MZ123",
+                        "callSid": "CA123",
+                        "customParameters": {"from_number": "+15551212"},
+                    },
+                },
+                {"event": "stop"},
+            ]
+        )
+        fake_client = _FakeRealtimeClient()
+
+        def _fake_claim(from_number: str):
+            claimed.append(from_number)
+            return fake_client
+
+        async def _fake_on_call_end(*_args, **_kwargs) -> None:
+            return None
+
+        async def _fake_build_session_bootstrap(
+            *,
+            caller_id: str,
+            from_number: str = "",
+            handoff_id: str | None = None,
+            standup_brief: str | None = None,
+            inbound_trusted: bool = False,
+            **_kwargs: object,
+        ) -> SessionBootstrap:
+            return SessionBootstrap("You are Bob.")
+
+        def _fake_make_client(_session_cfg, **_kwargs):
+            return fake_client
+
+        monkeypatch.setattr(server, "_claim_prewarm", _fake_claim)
+        monkeypatch.setattr(server, "_on_call_end", _fake_on_call_end)
+        monkeypatch.setattr(
+            server, "_build_session_bootstrap", _fake_build_session_bootstrap
+        )
+        monkeypatch.setattr(server, "_make_client", _fake_make_client)
+        monkeypatch.setattr(
+            "gptme_voice.realtime.server.GptmeToolBridge", _DummyToolBridge
+        )
+        await server.handle_twilio_websocket(websocket)
+
+    asyncio.run(_exercise())
+    assert claimed == []
+
+
 def test_twilio_websocket_does_not_grant_rag_tools_from_spoofed_from_number(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
