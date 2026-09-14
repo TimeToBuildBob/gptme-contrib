@@ -47,6 +47,11 @@ from .openai_client import (
     _load_project_instructions,
 )
 from .sounds import DISPATCH_CUE_MULAW, PCM_CUES, SAMPLE_RATE, TIMEOUT_CUE_MULAW
+from .standup_callback import (
+    build_missed_standup_callback_greeting,
+    build_missed_standup_callback_guidance,
+    load_missed_standup_callback_brief,
+)
 from .tool_bridge import GptmeToolBridge
 from .twilio_integration import (
     _get_config_env,
@@ -886,6 +891,11 @@ class VoiceServer:
         # into a duplicate cold session (observed 2026-08-27: Twilio's "start"
         # arrived before "Pre-warm ready", leaving an orphaned provider session).
         self._prewarm_tasks: dict[str, asyncio.Task] = {}
+        # Whether the matching /incoming webhook was signature-validated.
+        # Pre-warm bootstrap may load operator-only standup callback context
+        # only when this is True; a spoofed /twilio start event must not
+        # inherit that trust from customParameters.from_number.
+        self._prewarm_inbound_trusted: dict[str, bool] = {}
         # Numbers whose pre-warm has connected and is finalizing (consuming
         # resume state). Cancelling in this phase could lose resume context,
         # so _claim_prewarm briefly extends its wait instead.
@@ -1601,6 +1611,7 @@ class VoiceServer:
         handoff_id: str | None = None,
         standup_brief: str | None = None,
         consume_recent: bool = True,
+        inbound_trusted: bool = False,
     ) -> SessionBootstrap:
         instructions = self._instructions
         if from_number:
@@ -1627,13 +1638,28 @@ class VoiceServer:
         # (Philip's first call was greeted with subagent status, 2026-08-27).
         # Calls with no from_number (local/browser transport) keep the digest.
         caller_is_operator = True
+        caller_identity = None
         if from_number:
-            identity = _lookup_caller_identity(from_number, self.workspace)
-            caller_is_operator = bool(identity and identity.is_operator)
+            caller_identity = _lookup_caller_identity(from_number, self.workspace)
+            caller_is_operator = bool(caller_identity and caller_identity.is_operator)
+
+        # Trusted inbound callback after a missed scheduled standup: load the
+        # same generated plan the outbound call used. inbound_trusted must come
+        # from the signed /incoming webhook or a matching call-scoped grant —
+        # never from spoofable WebSocket customParameters.from_number alone
+        # (2026-09-14: Erik's callback searched journals and missed the brief).
+        callback_brief = None
+        if inbound_trusted and caller_is_operator and not standup_brief:
+            callback_brief = load_missed_standup_callback_brief(
+                self.workspace,
+                trusted=True,
+                caller_is_operator=True,
+            )
+
         activity_digest = (
             _load_voice_digest(self.workspace) if caller_is_operator else None
         )
-        if activity_digest and not standup_brief:
+        if activity_digest and not standup_brief and not callback_brief:
             instructions = _prepend_activity_digest(activity_digest, instructions)
 
         # standup_brief takes priority over recent-call resume: an explicit outbound
@@ -1650,6 +1676,27 @@ class VoiceServer:
                 should_greet_first=True,
                 initial_response_instructions=_build_standup_call_instructions(
                     standup_brief
+                ),
+            )
+
+        if callback_brief:
+            spoken_name = (
+                caller_identity.preferred_spoken_name
+                if caller_identity is not None
+                else "there"
+            )
+            return SessionBootstrap(
+                instructions=(
+                    build_missed_standup_callback_guidance()
+                    + "\n\n"
+                    + callback_brief
+                    + "\n\n"
+                    + instructions
+                ),
+                should_greet_first=True,
+                initial_response_instructions=build_missed_standup_callback_greeting(
+                    spoken_name=spoken_name,
+                    agent_name=self._agent_name,
                 ),
             )
 
@@ -1684,6 +1731,7 @@ class VoiceServer:
         ]
         for num in stale:
             client, _ = self._prewarm_sessions.pop(num)
+            self._prewarm_inbound_trusted.pop(num, None)
             logger.info("Evicting stale pre-warm for %s", num)
             asyncio.create_task(self._disconnect_realtime_client(client))
 
@@ -1707,6 +1755,7 @@ class VoiceServer:
                 caller_id=from_number,
                 from_number=from_number,
                 consume_recent=False,
+                inbound_trusted=self._prewarm_inbound_trusted.get(from_number, False),
             )
             session_cfg = self._build_session_config(
                 instructions=bootstrap.instructions,
@@ -1752,8 +1801,11 @@ class VoiceServer:
         finally:
             self._prewarm_connected.discard(from_number)
 
-    def _register_prewarm_task(self, from_number: str) -> None:
+    def _register_prewarm_task(
+        self, from_number: str, *, inbound_trusted: bool = False
+    ) -> None:
         """Start a pre-warm task for from_number and track it for claiming."""
+        self._prewarm_inbound_trusted[from_number] = inbound_trusted
         task = asyncio.create_task(self._prewarm_for_inbound(from_number))
         self._prewarm_tasks[from_number] = task
 
@@ -1867,6 +1919,7 @@ class VoiceServer:
     def _reap_prewarm_entry(self, from_number: str) -> None:
         """Remove and disconnect a stored pre-warm session, if one exists."""
         entry = self._prewarm_sessions.pop(from_number, None)
+        self._prewarm_inbound_trusted.pop(from_number, None)
         if entry is not None:
             client, _ = entry
             asyncio.create_task(self._disconnect_realtime_client(client))
@@ -2378,7 +2431,9 @@ class VoiceServer:
         # Twilio's media-stream WebSocket sends its "start" event.  This eliminates
         # most of the ~1-3s dead air between call answer and first greeting audio.
         if from_number:
-            self._register_prewarm_task(from_number)
+            self._register_prewarm_task(
+                from_number, inbound_trusted=signature_validated
+            )
 
         # Forward caller number to WebSocket handler via TwiML custom parameters.
         custom_params: dict[str, str] = {}
@@ -2534,22 +2589,17 @@ class VoiceServer:
                     prewarm_eligible = (
                         from_number and not handoff_id and not standup_brief
                     )
-                    # A spoofed start event must not steal a body- or rag-capable
-                    # prewarm: the prewarmed session's tool schema was built from
-                    # from_number at the signed /incoming webhook, so if this
-                    # start event's grant doesn't check out, claiming it would
-                    # hand the caller a session that already advertised
-                    # body_* / workspace_search tools with no authorized adapter
-                    # or rag instance behind them (tool_bridge below is wired
-                    # using granted_from, which is None here).
+                    # A spoofed start event must not steal a prewarm built from
+                    # the signed /incoming webhook. That session may already
+                    # contain operator-only standup callback context and, when
+                    # body/rag are enabled, a tool schema built from
+                    # from_number. Require the call-scoped grant minted after
+                    # signature validation — customParameters.from_number is
+                    # attacker-controlled on /twilio.
                     if (
                         prewarm_eligible
                         and self._twilio_body_caller_allowed(from_number)
                         and granted_from is None
-                        and (
-                            self.body_adapter is not None
-                            or (self._rag is not None and self._rag.enabled)
-                        )
                     ):
                         prewarm_eligible = False
                     prewarm_client = (
@@ -2571,6 +2621,7 @@ class VoiceServer:
                             from_number=from_number,
                             handoff_id=handoff_id,
                             standup_brief=standup_brief,
+                            inbound_trusted=granted_from is not None,
                         )
                         instructions = bootstrap.instructions
                         initial_response_instructions = (

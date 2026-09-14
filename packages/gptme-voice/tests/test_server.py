@@ -498,6 +498,8 @@ def test_twilio_body_grant_idle_revoke_after_websocket_drop_without_stop(
         from_number: str = "",
         handoff_id: str | None = None,
         standup_brief: str | None = None,
+        inbound_trusted: bool = False,
+        **_kwargs: object,
     ) -> SessionBootstrap:
         return SessionBootstrap("You are Bob.")
 
@@ -593,6 +595,8 @@ def test_twilio_body_grant_survives_reconnect_start_then_revokes_on_stop(
         from_number: str = "",
         handoff_id: str | None = None,
         standup_brief: str | None = None,
+        inbound_trusted: bool = False,
+        **_kwargs: object,
     ) -> SessionBootstrap:
         return SessionBootstrap("You are Bob.")
 
@@ -864,6 +868,8 @@ def test_twilio_websocket_does_not_grant_body_tools_from_spoofed_from_number(
             from_number: str = "",
             handoff_id: str | None = None,
             standup_brief: str | None = None,
+            inbound_trusted: bool = False,
+            **_kwargs: object,
         ) -> SessionBootstrap:
             return SessionBootstrap("You are Bob.")
 
@@ -942,6 +948,8 @@ def test_twilio_body_grant_requires_matching_from_and_call_sid(
             from_number: str = "",
             handoff_id: str | None = None,
             standup_brief: str | None = None,
+            inbound_trusted: bool = False,
+            **_kwargs: object,
         ) -> SessionBootstrap:
             return SessionBootstrap("You are Bob.")
 
@@ -1040,6 +1048,8 @@ def test_twilio_spoof_cannot_steal_body_capable_prewarm(
             from_number: str = "",
             handoff_id: str | None = None,
             standup_brief: str | None = None,
+            inbound_trusted: bool = False,
+            **_kwargs: object,
         ) -> SessionBootstrap:
             return SessionBootstrap("You are Bob.")
 
@@ -1116,6 +1126,8 @@ def test_twilio_websocket_does_not_grant_rag_tools_from_spoofed_from_number(
             from_number: str = "",
             handoff_id: str | None = None,
             standup_brief: str | None = None,
+            inbound_trusted: bool = False,
+            **_kwargs: object,
         ) -> SessionBootstrap:
             return SessionBootstrap("You are Bob.")
 
@@ -1197,6 +1209,8 @@ def test_twilio_spoof_cannot_steal_rag_capable_prewarm(
             from_number: str = "",
             handoff_id: str | None = None,
             standup_brief: str | None = None,
+            inbound_trusted: bool = False,
+            **_kwargs: object,
         ) -> SessionBootstrap:
             return SessionBootstrap("You are Bob.")
 
@@ -1609,6 +1623,8 @@ def test_handle_twilio_websocket_wires_speech_started_clear_callback_cold_path(
             from_number: str = "",
             handoff_id: str | None = None,
             standup_brief: str | None = None,
+            inbound_trusted: bool = False,
+            **_kwargs: object,
         ) -> SessionBootstrap:
             return SessionBootstrap("You are Bob.")
 
