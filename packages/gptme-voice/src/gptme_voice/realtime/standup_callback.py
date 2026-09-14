@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 CALLBACK_WINDOW = timedelta(minutes=30)
 MAX_BRIEF_AGE = timedelta(hours=24)
 FUTURE_SKEW = timedelta(minutes=5)
+# Outbound standup is still ringing (or about to connect). A callback in this
+# window is not yet a miss — wait until the call has had time to answer or
+# time out before injecting the brief.
+RINGING_GRACE = timedelta(seconds=20)
 
 BRIEF_RELATIVE_PATH = Path("state") / "standup-brief.json"
 SID_STAMP_RELATIVE_PATH = Path("state") / "voice-calls" / "last-standup-call-sid.txt"
@@ -251,6 +255,9 @@ def load_missed_standup_callback_brief(
     call_sid, placed_at = stamp
     delta = current - placed_at
     if delta < -FUTURE_SKEW or delta > CALLBACK_WINDOW:
+        return None
+    if timedelta(0) <= delta < RINGING_GRACE:
+        # Still ringing or not yet timed out — not a miss yet.
         return None
     if _outbound_was_answered(root, call_sid):
         logger.info(

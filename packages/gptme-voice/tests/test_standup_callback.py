@@ -154,6 +154,18 @@ def test_load_allows_date_boundary_within_window(tmp_path: Path) -> None:
     assert "Good morning Erik, here is the standup." in result
 
 
+def test_load_rejects_still_ringing_outbound(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 14, 8, 0, 15, tzinfo=timezone.utc)
+    _fresh_artifacts(tmp_path, now=now, placed_delta=timedelta(seconds=10))
+
+    assert (
+        load_missed_standup_callback_brief(
+            tmp_path, trusted=True, caller_is_operator=True, now=now
+        )
+        is None
+    )
+
+
 def test_load_rejects_unrelated_timing(tmp_path: Path) -> None:
     now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
     _fresh_artifacts(tmp_path, now=now, placed_delta=timedelta(hours=2))
