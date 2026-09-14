@@ -9,7 +9,8 @@ This module reconstructs that continuity from workspace artifacts:
 
 - ``state/standup-brief.json`` — the same generated plan the outbound call used
 - ``state/voice-calls/last-standup-call-sid.txt`` — evidence the standup was placed
-- ``state/voice-calls/archive/*{sid}*`` — presence means the outbound was answered
+- ``state/voice-calls/last-standup-answered.txt`` — media-stream start (answered)
+- ``state/voice-calls/archive/*-{sid}.json`` and ``recent/*.json`` — hangup fallbacks
 
 Fail closed on untrusted callers, non-operators, stale/malformed briefs,
 unrelated timing, and answered outbound calls.
@@ -30,7 +31,11 @@ FUTURE_SKEW = timedelta(minutes=5)
 
 BRIEF_RELATIVE_PATH = Path("state") / "standup-brief.json"
 SID_STAMP_RELATIVE_PATH = Path("state") / "voice-calls" / "last-standup-call-sid.txt"
+ANSWERED_STAMP_RELATIVE_PATH = (
+    Path("state") / "voice-calls" / "last-standup-answered.txt"
+)
 ARCHIVE_RELATIVE_DIR = Path("state") / "voice-calls" / "archive"
+RECENT_RELATIVE_DIR = Path("state") / "voice-calls" / "recent"
 
 CALLBACK_GUIDANCE_MARK = "MISSED STANDUP CALLBACK GUIDANCE"
 
@@ -82,14 +87,88 @@ def _load_sid_stamp(path: Path) -> tuple[str, datetime] | None:
     return sid.strip(), placed_at
 
 
-def _outbound_was_answered(archive_dir: Path, call_sid: str) -> bool:
-    """An archive file for the outbound SID means the media stream started."""
+def stamp_standup_answered(
+    workspace: str | Path | None,
+    call_sid: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Record that the outbound standup media stream actually started.
+
+    Written at Twilio ``start`` (answer), not at hangup. Missed calls never
+    open a media stream, so this stamp is the evidence that the standup was
+    delivered rather than missed. Best-effort: must not break the live call.
+    """
+    if not workspace or not call_sid.strip():
+        return
+    path = Path(workspace) / ANSWERED_STAMP_RELATIVE_PATH
+    stamp_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "sid": call_sid.strip(),
+                    "answered_at": stamp_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("could not stamp standup answered: %s", exc)
+
+
+def _answered_stamp_matches(path: Path, call_sid: str) -> bool:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(raw, dict) and raw.get("sid") == call_sid
+
+
+def _archive_has_sid(archive_dir: Path, call_sid: str) -> bool:
+    """Ended-call fallback: Bob archives are named ``...-twilio-{sid}.json``."""
     if not call_sid or not archive_dir.is_dir():
         return False
     try:
-        return any(path.is_file() for path in archive_dir.glob(f"*{call_sid}*"))
+        return any(path.is_file() for path in archive_dir.glob(f"*-{call_sid}.json"))
     except OSError:
         return False
+
+
+def _recent_has_sid(recent_dir: Path, call_sid: str) -> bool:
+    if not call_sid or not recent_dir.is_dir():
+        return False
+    try:
+        paths = list(recent_dir.glob("*.json"))
+    except OSError:
+        return False
+    for path in paths:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        metadata = raw.get("metadata")
+        if isinstance(metadata, dict) and metadata.get("call_sid") == call_sid:
+            return True
+    return False
+
+
+def _outbound_was_answered(root: Path, call_sid: str) -> bool:
+    """True when the outbound standup connected, including in-progress calls.
+
+    Archive/recent files are written at hangup. The answered stamp is written
+    at media-stream start, so a callback during or immediately after an
+    answered standup does not look like a miss.
+    """
+    if _answered_stamp_matches(root / ANSWERED_STAMP_RELATIVE_PATH, call_sid):
+        return True
+    if _archive_has_sid(root / ARCHIVE_RELATIVE_DIR, call_sid):
+        return True
+    return _recent_has_sid(root / RECENT_RELATIVE_DIR, call_sid)
 
 
 def format_callback_brief(brief: dict[str, object]) -> str:
@@ -173,7 +252,7 @@ def load_missed_standup_callback_brief(
     delta = current - placed_at
     if delta < -FUTURE_SKEW or delta > CALLBACK_WINDOW:
         return None
-    if _outbound_was_answered(root / ARCHIVE_RELATIVE_DIR, call_sid):
+    if _outbound_was_answered(root, call_sid):
         logger.info(
             "Skipping missed-standup callback brief; outbound %s was answered",
             call_sid,

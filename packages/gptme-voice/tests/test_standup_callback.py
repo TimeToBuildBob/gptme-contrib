@@ -179,6 +179,41 @@ def test_load_rejects_answered_outbound(tmp_path: Path) -> None:
     )
 
 
+def test_load_rejects_answered_stamp_without_archive(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
+    _fresh_artifacts(tmp_path, now=now)
+    (tmp_path / "state" / "voice-calls" / "last-standup-answered.txt").write_text(
+        json.dumps(
+            {"sid": OUTBOUND_SID, "answered_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+        )
+        + "\n"
+    )
+
+    assert (
+        load_missed_standup_callback_brief(
+            tmp_path, trusted=True, caller_is_operator=True, now=now
+        )
+        is None
+    )
+
+
+def test_load_rejects_answered_recent_record(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
+    _fresh_artifacts(tmp_path, now=now)
+    recent_dir = tmp_path / "state" / "voice-calls" / "recent"
+    recent_dir.mkdir(parents=True, exist_ok=True)
+    (recent_dir / "abc123def456.json").write_text(
+        json.dumps({"metadata": {"call_sid": OUTBOUND_SID}, "transcript": []}) + "\n"
+    )
+
+    assert (
+        load_missed_standup_callback_brief(
+            tmp_path, trusted=True, caller_is_operator=True, now=now
+        )
+        is None
+    )
+
+
 def test_load_rejects_untrusted_caller(tmp_path: Path) -> None:
     now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
     _fresh_artifacts(tmp_path, now=now)
@@ -217,7 +252,7 @@ def _operator_workspace(tmp_path: Path) -> None:
 
 
 def test_bootstrap_injects_fresh_trusted_callback(tmp_path: Path) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
     _operator_workspace(tmp_path)
     _fresh_artifacts(tmp_path, now=now)
     server = VoiceServer(workspace=str(tmp_path))
@@ -228,6 +263,7 @@ def test_bootstrap_injects_fresh_trusted_callback(tmp_path: Path) -> None:
             caller_id=ERIK_NUMBER,
             from_number=ERIK_NUMBER,
             inbound_trusted=True,
+            now=now,
         )
     )
 
@@ -246,7 +282,7 @@ def test_bootstrap_injects_fresh_trusted_callback(tmp_path: Path) -> None:
 
 
 def test_bootstrap_stale_brief_keeps_normal_inbound(tmp_path: Path) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
     _operator_workspace(tmp_path)
     _fresh_artifacts(tmp_path, now=now, generated_delta=timedelta(hours=25))
     server = VoiceServer(workspace=str(tmp_path))
@@ -257,6 +293,7 @@ def test_bootstrap_stale_brief_keeps_normal_inbound(tmp_path: Path) -> None:
             caller_id=ERIK_NUMBER,
             from_number=ERIK_NUMBER,
             inbound_trusted=True,
+            now=now,
         )
     )
 
@@ -266,7 +303,7 @@ def test_bootstrap_stale_brief_keeps_normal_inbound(tmp_path: Path) -> None:
 
 
 def test_bootstrap_unrelated_timing_keeps_normal_inbound(tmp_path: Path) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
     _operator_workspace(tmp_path)
     _fresh_artifacts(tmp_path, now=now, placed_delta=timedelta(hours=2))
     server = VoiceServer(workspace=str(tmp_path))
@@ -277,6 +314,7 @@ def test_bootstrap_unrelated_timing_keeps_normal_inbound(tmp_path: Path) -> None
             caller_id=ERIK_NUMBER,
             from_number=ERIK_NUMBER,
             inbound_trusted=True,
+            now=now,
         )
     )
 
@@ -285,7 +323,7 @@ def test_bootstrap_unrelated_timing_keeps_normal_inbound(tmp_path: Path) -> None
 
 
 def test_bootstrap_untrusted_caller_does_not_get_brief(tmp_path: Path) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
     _operator_workspace(tmp_path)
     _fresh_artifacts(tmp_path, now=now)
     server = VoiceServer(workspace=str(tmp_path))
@@ -296,6 +334,7 @@ def test_bootstrap_untrusted_caller_does_not_get_brief(tmp_path: Path) -> None:
             caller_id=ERIK_NUMBER,
             from_number=ERIK_NUMBER,
             inbound_trusted=False,
+            now=now,
         )
     )
     non_operator = asyncio.run(
@@ -303,6 +342,7 @@ def test_bootstrap_untrusted_caller_does_not_get_brief(tmp_path: Path) -> None:
             caller_id=PHILIP_NUMBER,
             from_number=PHILIP_NUMBER,
             inbound_trusted=True,
+            now=now,
         )
     )
 
@@ -313,7 +353,7 @@ def test_bootstrap_untrusted_caller_does_not_get_brief(tmp_path: Path) -> None:
 
 
 def test_bootstrap_explicit_outbound_brief_still_wins(tmp_path: Path) -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
     _operator_workspace(tmp_path)
     _fresh_artifacts(tmp_path, now=now)
     server = VoiceServer(workspace=str(tmp_path))
@@ -325,6 +365,7 @@ def test_bootstrap_explicit_outbound_brief_still_wins(tmp_path: Path) -> None:
             from_number=ERIK_NUMBER,
             standup_brief="OUTBOUND BRIEF PAYLOAD",
             inbound_trusted=True,
+            now=now,
         )
     )
 

@@ -51,6 +51,7 @@ from .standup_callback import (
     build_missed_standup_callback_greeting,
     build_missed_standup_callback_guidance,
     load_missed_standup_callback_brief,
+    stamp_standup_answered,
 )
 from .tool_bridge import GptmeToolBridge
 from .twilio_integration import (
@@ -1612,6 +1613,7 @@ class VoiceServer:
         standup_brief: str | None = None,
         consume_recent: bool = True,
         inbound_trusted: bool = False,
+        now: datetime | None = None,
     ) -> SessionBootstrap:
         instructions = self._instructions
         if from_number:
@@ -1654,6 +1656,7 @@ class VoiceServer:
                 self.workspace,
                 trusted=True,
                 caller_is_operator=True,
+                now=now,
             )
 
         activity_digest = (
@@ -2507,6 +2510,10 @@ class VoiceServer:
                     handoff_id = custom_params.get("handoff_id") or None
                     standup_brief = custom_params.get("standup_brief") or None
                     caller_id = remote_party or call_sid or stream_sid
+                    # Outbound standup actually connected: stamp before hangup
+                    # so a later inbound callback does not look like a miss.
+                    if standup_brief and call_sid:
+                        stamp_standup_answered(self.workspace, call_sid)
                     metadata = {
                         "from_number": from_number,
                         "remote_party": remote_party,
