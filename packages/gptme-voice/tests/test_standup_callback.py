@@ -209,6 +209,28 @@ def test_load_rejects_answered_stamp_without_archive(tmp_path: Path) -> None:
     )
 
 
+def test_load_rejects_answered_archive_in_voice_state_dir(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
+    _fresh_artifacts(tmp_path, now=now)
+    state_dir = tmp_path / "voice-state"
+    archive_dir = state_dir / "archive"
+    archive_dir.mkdir(parents=True)
+    (archive_dir / f"20260914T080000Z-000-twilio-{OUTBOUND_SID}.json").write_text(
+        json.dumps({"metadata": {"call_sid": OUTBOUND_SID}}) + "\n"
+    )
+
+    assert (
+        load_missed_standup_callback_brief(
+            tmp_path,
+            trusted=True,
+            caller_is_operator=True,
+            now=now,
+            state_dir=state_dir,
+        )
+        is None
+    )
+
+
 def test_load_rejects_answered_recent_record(tmp_path: Path) -> None:
     now = datetime(2026, 9, 14, 8, 2, tzinfo=timezone.utc)
     _fresh_artifacts(tmp_path, now=now)

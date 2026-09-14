@@ -96,31 +96,41 @@ def stamp_standup_answered(
     call_sid: str,
     *,
     now: datetime | None = None,
+    state_dir: str | Path | None = None,
 ) -> None:
     """Record that the outbound standup media stream actually started.
 
     Written at Twilio ``start`` (answer), not at hangup. Missed calls never
     open a media stream, so this stamp is the evidence that the standup was
     delivered rather than missed. Best-effort: must not break the live call.
+
+    Written under the workspace voice-calls dir (Bob's initiate-script layout)
+    and, when provided, ``GPTME_VOICE_STATE_DIR`` so archive fallbacks line up
+    with VoiceServer.state_dir even when that is not ``<workspace>/state/voice-calls``.
     """
-    if not workspace or not call_sid.strip():
+    if not call_sid.strip():
         return
-    path = Path(workspace) / ANSWERED_STAMP_RELATIVE_PATH
     stamp_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {
-                    "sid": call_sid.strip(),
-                    "answered_at": stamp_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                }
-            )
-            + "\n",
-            encoding="utf-8",
+    payload = (
+        json.dumps(
+            {
+                "sid": call_sid.strip(),
+                "answered_at": stamp_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
         )
-    except OSError as exc:
-        logger.warning("could not stamp standup answered: %s", exc)
+        + "\n"
+    )
+    paths: list[Path] = []
+    if workspace:
+        paths.append(Path(workspace) / ANSWERED_STAMP_RELATIVE_PATH)
+    if state_dir:
+        paths.append(Path(state_dir) / "last-standup-answered.txt")
+    for path in paths:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(payload, encoding="utf-8")
+        except OSError as exc:
+            logger.warning("could not stamp standup answered at %s: %s", path, exc)
 
 
 def _answered_stamp_matches(path: Path, call_sid: str) -> bool:
@@ -161,7 +171,21 @@ def _recent_has_sid(recent_dir: Path, call_sid: str) -> bool:
     return False
 
 
-def _outbound_was_answered(root: Path, call_sid: str) -> bool:
+def _voice_state_was_answered(state_dir: Path, call_sid: str) -> bool:
+    """Check GPTME_VOICE_STATE_DIR layout (archive/, recent/, answered stamp)."""
+    if _answered_stamp_matches(state_dir / "last-standup-answered.txt", call_sid):
+        return True
+    if _archive_has_sid(state_dir / "archive", call_sid):
+        return True
+    return _recent_has_sid(state_dir / "recent", call_sid)
+
+
+def _outbound_was_answered(
+    root: Path,
+    call_sid: str,
+    *,
+    state_dir: str | Path | None = None,
+) -> bool:
     """True when the outbound standup connected, including in-progress calls.
 
     Archive/recent files are written at hangup. The answered stamp is written
@@ -172,7 +196,11 @@ def _outbound_was_answered(root: Path, call_sid: str) -> bool:
         return True
     if _archive_has_sid(root / ARCHIVE_RELATIVE_DIR, call_sid):
         return True
-    return _recent_has_sid(root / RECENT_RELATIVE_DIR, call_sid)
+    if _recent_has_sid(root / RECENT_RELATIVE_DIR, call_sid):
+        return True
+    if state_dir:
+        return _voice_state_was_answered(Path(state_dir), call_sid)
+    return False
 
 
 def format_callback_brief(brief: dict[str, object]) -> str:
@@ -232,6 +260,7 @@ def load_missed_standup_callback_brief(
     trusted: bool,
     caller_is_operator: bool,
     now: datetime | None = None,
+    state_dir: str | Path | None = None,
 ) -> str | None:
     """Return the formatted standup plan when this inbound is a missed callback.
 
@@ -259,7 +288,7 @@ def load_missed_standup_callback_brief(
     if timedelta(0) <= delta < RINGING_GRACE:
         # Still ringing or not yet timed out — not a miss yet.
         return None
-    if _outbound_was_answered(root, call_sid):
+    if _outbound_was_answered(root, call_sid, state_dir=state_dir):
         logger.info(
             "Skipping missed-standup callback brief; outbound %s was answered",
             call_sid,

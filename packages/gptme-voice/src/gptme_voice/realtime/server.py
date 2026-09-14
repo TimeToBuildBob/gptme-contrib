@@ -1657,6 +1657,7 @@ class VoiceServer:
                 trusted=True,
                 caller_is_operator=True,
                 now=now,
+                state_dir=self.state_dir,
             )
 
         activity_digest = (
@@ -2511,7 +2512,9 @@ class VoiceServer:
                     # Outbound standup actually connected: stamp before hangup
                     # so a later inbound callback does not look like a miss.
                     if standup_brief and call_sid:
-                        stamp_standup_answered(self.workspace, call_sid)
+                        stamp_standup_answered(
+                            self.workspace, call_sid, state_dir=self.state_dir
+                        )
                     metadata = {
                         "from_number": from_number,
                         "remote_party": remote_party,
