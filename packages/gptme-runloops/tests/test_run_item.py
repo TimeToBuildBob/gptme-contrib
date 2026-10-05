@@ -2677,7 +2677,7 @@ def test_post_session_thread_deliverable_item_still_runs_delivery_check(
 ) -> None:
     """Regression guard: the delivery check must run for every thread-deliverable type.
 
-    THREAD_DELIVERABLE_TYPES lists all eight thread-bearing item types. If any of
+    THREAD_DELIVERABLE_TYPES lists all thread-bearing item types. If any of
     them is accidentally removed from the set, the delivery post-condition would
     silently stop running for those items. This parametrized test ensures each type
     in the set actually triggers the check — a future accidental removal will
@@ -2707,6 +2707,26 @@ def test_post_session_thread_deliverable_item_still_runs_delivery_check(
         f"— was it accidentally removed from THREAD_DELIVERABLE_TYPES?"
     )
     assert latency_calls[0]["outcome"] == "orphan_no_delivery"
+
+
+def test_pr_never_checked_reply_is_an_observed_effect(tmp_path) -> None:
+    """A maintainer approval plus thread reply must close the recovery epoch.
+
+    gptme/gptme#4145 approved four held fork workflows and posted the contributor
+    reply, but this type skipped the delivery check and graded ``effect=none``.
+    The owed-rearm loop then kept redispatching the already-resolved item.
+    """
+    config, item, plan, outcome, hooks, run_cmd, _ = _post_session_fixture(
+        tmp_path, types=("pr_never_checked",)
+    )
+    hooks.wait_merge_gate = None
+    hooks.arc_manager = None
+    run_cmd.on("/fake/check-delivery.py", stdout='{"outcome": "handled"}')
+
+    effect = run_post_session(plan, item, outcome, config, hooks)
+
+    assert run_cmd.find("/fake/check-delivery.py") != []
+    assert effect == EFFECT_OBSERVED
 
 
 def test_post_session_gate_exit_2_warns_no_helper(tmp_path) -> None:

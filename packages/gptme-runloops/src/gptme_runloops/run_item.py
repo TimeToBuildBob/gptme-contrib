@@ -218,6 +218,7 @@ THREAD_DELIVERABLE_TYPES: frozenset[str] = frozenset(
         "reviewer_needs_fix",
         "merge_conflict",
         "notification",
+        "pr_never_checked",
     }
 )
 
