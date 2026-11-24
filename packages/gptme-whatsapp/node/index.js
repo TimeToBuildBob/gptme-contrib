@@ -31,7 +31,7 @@ import { existsSync } from 'fs';
 // Config from env
 const AGENT_NAME = process.env.GPTME_AGENT || 'sven';
 const BACKEND = process.env.BACKEND || 'gptme'; // 'gptme' or 'claude-code'
-const ALLOWED_CONTACTS = (process.env.ALLOWED_CONTACTS || '').split(',').filter(Boolean);
+const ALLOWED_CONTACTS = (process.env.ALLOWED_CONTACTS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const GPTME_CMD = process.env.GPTME_CMD || 'gptme';
 const CLAUDE_CMD = process.env.CLAUDE_CMD || 'claude';
 const WORKSPACE = process.env.AGENT_WORKSPACE || process.env.HOME + '/' + AGENT_NAME;
@@ -45,7 +45,7 @@ if (ALLOWED_CONTACTS.length > 0) {
 }
 if (BACKEND === 'claude-code' && !existsSync(SYSTEM_PROMPT_FILE)) {
     console.log(`Warning: SYSTEM_PROMPT_FILE not found at ${SYSTEM_PROMPT_FILE}`);
-    console.log('Run: cd ${WORKSPACE} && ./scripts/build-system-prompt.sh > ${SYSTEM_PROMPT_FILE}');
+    console.log(`Run: cd ${WORKSPACE} && ./scripts/build-system-prompt.sh > ${SYSTEM_PROMPT_FILE}`);
 }
 
 const client = new Client({
@@ -70,7 +70,21 @@ client.on('auth_failure', (msg) => {
     process.exit(1);
 });
 
+// One in-flight agent call per sender: two quick messages would otherwise
+// start two processes on the same conversation, and the second one fails on
+// the conversation lock and is dropped without a reply.
+const senderQueues = new Map();
+
 client.on('message', async (msg) => {
+    try {
+        await handleMessage(msg);
+    } catch (err) {
+        // An unhandled rejection here would exit the whole bridge.
+        console.error('Failed to handle message:', err);
+    }
+});
+
+async function handleMessage(msg) {
     // Skip group messages, status updates, etc.
     if (msg.from.endsWith('@g.us') || msg.from === 'status@broadcast') {
         return;
@@ -82,7 +96,11 @@ client.on('message', async (msg) => {
     }
 
     const sender = msg.from.replace('@c.us', '');
-    const body = msg.body.trim();
+    // NUL bytes make spawn() throw ERR_INVALID_ARG_VALUE.
+    const body = msg.body.replace(/\0/g, '').trim();
+    if (!body) {
+        return;
+    }
 
     // Check allowlist if configured
     if (ALLOWED_CONTACTS.length > 0 && !ALLOWED_CONTACTS.includes(sender)) {
@@ -92,13 +110,22 @@ client.on('message', async (msg) => {
 
     console.log(`[${new Date().toISOString()}] Message from ${sender}: ${body.slice(0, 80)}...`);
 
-    // Call agent backend non-interactively
-    const response = await callAgent(sender, body);
-    if (response) {
-        await msg.reply(response);
-        console.log(`[${new Date().toISOString()}] Replied to ${sender}`);
-    }
-});
+    // Call agent backend non-interactively, serialized per sender
+    const previous = senderQueues.get(sender) || Promise.resolve();
+    const current = previous.then(async () => {
+        const response = await callAgent(sender, body);
+        if (response) {
+            await msg.reply(response);
+            console.log(`[${new Date().toISOString()}] Replied to ${sender}`);
+        }
+    });
+    const settled = current.catch(() => {});
+    senderQueues.set(sender, settled);
+    settled.then(() => {
+        if (senderQueues.get(sender) === settled) senderQueues.delete(sender);
+    });
+    await current;
+}
 
 /**
  * Call the agent backend with the message and return the response.
@@ -137,7 +164,7 @@ async function callGptme(sender, message) {
  * Uses --append-system-prompt-file for agent identity and --resume for history.
  */
 async function callClaudeCode(sender, message) {
-    const args = ['-p', message, '--output-format', 'text'];
+    const args = ['-p', '--output-format', 'text'];
 
     // Inject agent identity via system prompt file
     if (existsSync(SYSTEM_PROMPT_FILE)) {
@@ -147,6 +174,8 @@ async function callClaudeCode(sender, message) {
     // Resume previous conversation for this sender (maintains history)
     const convId = `whatsapp-${AGENT_NAME}-${sender.replace(/[^a-zA-Z0-9]/g, '-')}`;
     args.push('--resume', convId);
+    // '--' stops a message starting with '-' from being parsed as an option.
+    args.push('--', message);
 
     return spawnAndCapture(CLAUDE_CMD, args, (output) => {
         // Claude Code --output-format text returns just the response
@@ -185,7 +214,15 @@ function spawnAndCapture(cmd, args, responseExtractor) {
         proc.stdout.on('data', (data) => { stdout += data.toString(); });
         proc.stderr.on('data', (data) => { stderr += data.toString(); });
 
+        // Timeout: 120 seconds
+        const timer = setTimeout(() => {
+            proc.kill('SIGTERM');
+            console.error(`${cmd} timed out`);
+            resolve(null);
+        }, 120_000);
+
         proc.on('close', (code) => {
+            clearTimeout(timer);
             if (code !== 0) {
                 console.error(`${cmd} exited with code ${code}`);
                 console.error('stderr:', stderr.slice(-500));
@@ -198,16 +235,10 @@ function spawnAndCapture(cmd, args, responseExtractor) {
         });
 
         proc.on('error', (err) => {
+            clearTimeout(timer);
             console.error(`Failed to spawn ${cmd}:`, err);
             resolve(null);
         });
-
-        // Timeout: 120 seconds
-        setTimeout(() => {
-            proc.kill('SIGTERM');
-            console.error(`${cmd} timed out`);
-            resolve(null);
-        }, 120_000);
     });
 }
 
