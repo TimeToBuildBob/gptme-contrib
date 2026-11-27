@@ -52,6 +52,19 @@ def _commit(repo: Path, name: str, body: str = "x\n") -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+def _stub_gh(bin_dir: Path) -> None:
+    """Shadow ``gh`` so auto-merge disarm is a no-op (empty PR list, success).
+
+    The global hook runs ``disarm_auto_merge.py`` for any github.com gptme URL.
+    These tests are about brain-history ancestry, not auto-merge; without a
+    stub, CI's unauthenticated ``gh`` fail-closes the push.
+    """
+    bin_dir.mkdir(exist_ok=True)
+    gh = bin_dir / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n")
+    gh.chmod(0o755)
+
+
 def _run_hook(
     repo: Path,
     stdin: str,
@@ -60,13 +73,18 @@ def _run_hook(
     *,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    extra = env or {}
+    bin_dir = repo.parent / "bin"
+    _stub_gh(bin_dir)
+    path = extra.get("PATH", os.environ.get("PATH", ""))
     full_env = {
         **os.environ,
         "COORDINATION_DB": str(repo.parent / "coord.db"),
         "AGENT_WORKSPACE": str(repo.parent),
         "ALLOW_MASS_DELETE": "1",
         "ALLOW_FORCE_RESET_PUSH": "1",
-        **(env or {}),
+        **extra,
+        "PATH": f"{bin_dir}:{path}",
     }
     return subprocess.run(
         [str(HOOK), remote, url],
